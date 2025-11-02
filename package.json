@@ -1,10 +1,11 @@
 {
   "name": "qsafevault-server",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "set LOG_LOCAL=1&& set NODE_ENV=development&& node server.js"
   },
   "keywords": [],
   "author": "",
