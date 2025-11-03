@@ -273,9 +273,9 @@ app.get('/v1/sessions/:sessionId/answer', (req, res) => {
 
 app.delete('/v1/sessions/:sessionId', (req, res) => {
   const { sessionId } = req.params;
-  const sess = sessions.get(sessionId);
-  if (!sess) return res.status(404).json({ error: 'session_not_found' });
-
+  if (!isUuidV4(sessionId)) return error(res, 404, 'session_not_found');
+  
+  // DELETE is idempotent - clean up any associated data regardless of whether session exists
   for (const [pin, info] of pinToSession) {
     if (info.sessionId === sessionId) {
       pinToSession.delete(pin);
