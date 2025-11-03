@@ -1,24 +1,27 @@
 const { isUuidV4, validateEnvelope, parseJson, sendJson, error } = require('../../../_lib/utils');
-const { getSession, saveSession } = require('../../../_lib/store');
+const mem = require('../../../_lib/memstore');
 
-async function getAlive(sessionId, res) {
+function getAlive(sessionId, res) {
   if (!isUuidV4(sessionId)) { error(res, 404, 'session_not_found'); return null; }
-  const sess = await getSession(sessionId);
+  const sess = mem.getSessionById(sessionId);
   if (!sess) { error(res, 404, 'session_not_found'); return null; }
+  if (mem._expired(sess)) { error(res, 410, 'session_expired'); return null; }
   return sess;
 }
 
 module.exports = async function handler(req, res) {
   const { sessionId } = req.query;
+
   if (req.method === 'GET') {
-    const sess = await getAlive(sessionId, res);
+    const sess = getAlive(sessionId, res);
     if (!sess) return;
-    if (!sess.offerEnvelope) return error(res, 404, 'offer_not_set');
-    return sendJson(res, 200, { envelope: sess.offerEnvelope });
+    const env = mem.getOffer(sessionId);
+    if (!env) return error(res, 404, 'offer_not_set');
+    return sendJson(res, 200, { envelope: env });
   }
 
   if (req.method === 'POST') {
-    const sess = await getAlive(sessionId, res);
+    const sess = getAlive(sessionId, res);
     if (!sess) return;
     let body;
     try { body = await parseJson(req); } catch (e) {
@@ -28,9 +31,8 @@ module.exports = async function handler(req, res) {
     const { envelope } = body;
     const err = validateEnvelope(envelope, sess.id);
     if (err) return error(res, 400, err);
-    if (sess.offerEnvelope) return error(res, 409, 'offer_already_set');
-    sess.offerEnvelope = envelope;
-    await saveSession(sess);
+    if (mem.getOffer(sessionId)) return error(res, 409, 'offer_already_set');
+    mem.setOffer(sessionId, envelope);
     return sendJson(res, 200, {});
   }
 

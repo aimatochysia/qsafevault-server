@@ -21,7 +21,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Silence fatal error handlers (no stdout/stderr leakage)
 process.on('uncaughtException', () => {});
 process.on('unhandledRejection', () => {});
 
@@ -188,12 +187,11 @@ app.get('/v1/sessions/resolve', rateLimitResolveMiddleware, (req, res) => {
     return error(res, 404, 'pin_not_found');
   }
   const sess = sessions.get(map.sessionId);
-  pinToSession.delete(pin);
   if (!sess) {
-    return error(res, 410, 'pin_expired');
+    return error(res, 410, 'session_expired');
   }
   if (sessionExpired(sess)) {
-    return error(res, 410, 'pin_expired');
+    return error(res, 410, 'session_expired');
   }
   res.status(200).json({
     sessionId: sess.id,
@@ -274,7 +272,6 @@ app.delete('/v1/sessions/:sessionId', (req, res) => {
   const { sessionId } = req.params;
   if (!isUuidV4(sessionId)) return error(res, 404, 'session_not_found');
   
-  // DELETE is idempotent - clean up any associated data regardless of whether session exists
   for (const [pin, info] of pinToSession) {
     if (info.sessionId === sessionId) {
       pinToSession.delete(pin);
