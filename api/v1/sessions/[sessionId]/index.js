@@ -7,9 +7,7 @@ module.exports = async function handler(req, res) {
   const { sessionId } = req.query;
   if (!isUuidV4(sessionId)) return error(res, 404, 'session_not_found');
 
-  const sess = await getSession(sessionId);
-  if (!sess) return error(res, 404, 'session_not_found');
-
+  // DELETE is idempotent - even if session doesn't exist, return 204
   await deleteSession(sessionId);
   res.statusCode = 204;
   res.end();
