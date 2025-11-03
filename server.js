@@ -2,7 +2,6 @@ const express = require('express');
 const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const helmet = require('helmet');
-const cors = require('cors');
 
 const app = express();
 app.disable('x-powered-by');
