@@ -1,16 +1,5 @@
 const { generatePin } = require('./utils');
 
-let upstash = null;
-let redis = null;
-try {
-  const { Redis } = require('@upstash/redis');
-  const url = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (url && token) {
-    upstash = new Redis({ url, token });
-  }
-} catch {
-}
 let ensureRedis = null;
 try {
   const { createClient } = require('redis');
@@ -24,6 +13,18 @@ try {
     redis = { client, ensure: ensureRedis };
   }
 } catch {
+}
+
+const REQUIRE_PERSISTENT_KV =
+  ((process.env.VERCEL === '1') || (process.env.NODE_ENV === 'production')) &&
+  process.env.ALLOW_MEM_KV !== '1';
+
+function assertPersistentKv() {
+  if (REQUIRE_PERSISTENT_KV && !redis) {
+    throw new Error(
+      'No Redis configured. Set REDIS_URL to your managed Redis (e.g., rediss://user:pass@host:port).'
+    );
+  }
 }
 
 const mem = {
@@ -64,7 +65,7 @@ async function kvSet(key, val, ttlSec) {
     if (ttlSec) return c.set(key, payload, { EX: ttlSec });
     return c.set(key, payload);
   }
-  if (upstash) return upstash.set(key, JSON.stringify(val), { ex: ttlSec });
+  assertPersistentKv();
   return memSet(key, val, ttlSec);
 }
 async function kvGet(key) {
@@ -73,20 +74,17 @@ async function kvGet(key) {
     const out = await c.get(key);
     return out != null ? safeParse(out) : null;
   }
-  if (upstash) {
-    const out = await upstash.get(key);
-    return out ?? null;
-  }
+  assertPersistentKv();
   return memGet(key);
 }
 async function kvDel(key) {
   if (redis) { const c = await redis.ensure(); return c.del(key); }
-  if (upstash) return upstash.del(key);
+  assertPersistentKv();
   return memDel(key);
 }
 async function kvTtl(key) {
   if (redis) { const c = await redis.ensure(); return c.ttl(key); }
-  if (upstash) return upstash.ttl(key);
+  assertPersistentKv();
   return memTtl(key);
 }
 async function kvIncr(key, ttlSec) {
@@ -96,11 +94,7 @@ async function kvIncr(key, ttlSec) {
     if (v === 1 && ttlSec) await c.expire(key, ttlSec);
     return v;
   }
-  if (upstash) {
-    const v = await upstash.incr(key);
-    if (v === 1 && ttlSec) await upstash.expire(key, ttlSec);
-    return v;
-  }
+  assertPersistentKv();
   const cur = memGet(key);
   const v = (typeof cur === 'number' ? cur : 0) + 1;
   memSet(key, v, ttlSec);
@@ -112,19 +106,16 @@ async function kvSetNx(key, val, ttlSec) {
     const ok = await c.set(key, JSON.stringify(val), { NX: true, EX: ttlSec });
     return ok === 'OK';
   }
-  if (upstash) {
-    const ok = await upstash.set(key, JSON.stringify(val), { nx: true, ex: ttlSec });
-    return ok === 'OK';
-  }
   if (mem.map.has(key)) return false;
+  assertPersistentKv();
   memSet(key, val, ttlSec);
   return true;
 }
 async function kvExpire(key, ttlSec) {
   if (redis) { const c = await redis.ensure(); return c.expire(key, ttlSec); }
-  if (upstash) return upstash.expire(key, ttlSec);
   const v = memGet(key);
   if (v == null) return 0;
+  assertPersistentKv();
   memSet(key, v, ttlSec);
   return 1;
 }
