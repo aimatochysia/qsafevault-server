@@ -6,13 +6,13 @@
     "start": "vercel dev",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "engines": {
-    "node": ">=18.x"
-  },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "description": "",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "uuid": "^9.0.1"
   }
