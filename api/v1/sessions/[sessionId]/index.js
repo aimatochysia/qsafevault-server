@@ -1,5 +1,5 @@
-const { isUuidV4, sendJson, error } = require('../../../_lib/utils');
-const mem = require('../../../_lib/memstore');
+const { isUuidV4, error } = require('../../../_lib/utils');
+const { deleteSession } = require('../../../_lib/store');
 
 module.exports = async function handler(req, res) {
   if (req.method !== 'DELETE') return error(res, 405, 'method_not_allowed');
@@ -7,7 +7,7 @@ module.exports = async function handler(req, res) {
   const { sessionId } = req.query;
   if (!isUuidV4(sessionId)) return error(res, 404, 'session_not_found');
 
-  mem.deleteSession(sessionId);
+  await deleteSession(sessionId);
   res.statusCode = 204;
   res.end();
 };

@@ -1,11 +1,12 @@
 const { isUuidV4, validateEnvelope, parseJson, sendJson, error } = require('../../../_lib/utils');
-const mem = require('../../../_lib/memstore');
+const { getSession, saveSession, getSessionTtlSec, setSessionExpireSoon } = require('../../../_lib/store');
 
-function getAlive(sessionId, res) {
+async function getAlive(sessionId, res) {
   if (!isUuidV4(sessionId)) { error(res, 404, 'session_not_found'); return null; }
-  const sess = mem.getSessionById(sessionId);
+  const sess = await getSession(sessionId);
   if (!sess) { error(res, 404, 'session_not_found'); return null; }
-  if (mem._expired(sess)) { error(res, 410, 'session_expired'); return null; }
+  const ttl = await getSessionTtlSec(sessionId);
+  if (ttl <= 0) { error(res, 410, 'session_expired'); return null; }
   return sess;
 }
 
@@ -13,15 +14,19 @@ module.exports = async function handler(req, res) {
   const { sessionId } = req.query;
 
   if (req.method === 'GET') {
-    const sess = getAlive(sessionId, res);
+    const sess = await getAlive(sessionId, res);
     if (!sess) return;
-    const env = mem.getAnswer(sessionId);
-    if (!env) return error(res, 404, 'answer_not_set');
-    return sendJson(res, 200, { envelope: env });
+    if (!sess.answerEnvelope) return error(res, 404, 'answer_not_set');
+    if (!sess.answerDelivered) {
+      sess.answerDelivered = true;
+      await saveSession(sess);
+      await setSessionExpireSoon(sess.id, 1);
+    }
+    return sendJson(res, 200, { envelope: sess.answerEnvelope });
   }
 
   if (req.method === 'POST') {
-    const sess = getAlive(sessionId, res);
+    const sess = await getAlive(sessionId, res);
     if (!sess) return;
     let body;
     try { body = await parseJson(req); } catch (e) {
@@ -31,9 +36,10 @@ module.exports = async function handler(req, res) {
     const { envelope } = body;
     const err = validateEnvelope(envelope, sess.id);
     if (err) return error(res, 400, err);
-    if (!mem.getOffer(sessionId)) return error(res, 409, 'offer_not_set');
-    if (mem.getAnswer(sessionId)) return error(res, 409, 'answer_already_set');
-    mem.setAnswer(sessionId, envelope);
+    if (!sess.offerEnvelope) return error(res, 409, 'offer_not_set');
+    if (sess.answerEnvelope) return error(res, 409, 'answer_already_set');
+    sess.answerEnvelope = envelope;
+    await saveSession(sess);
     return sendJson(res, 200, {});
   }
 

@@ -14,6 +14,7 @@
     "node": ">=18"
   },
   "dependencies": {
-    "uuid": "^9.0.1"
+    "uuid": "^9.0.1",
+    "@upstash/redis": "^1.28.4"
   }
 }

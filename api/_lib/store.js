@@ -174,6 +174,11 @@ async function resolvePinOnce(pin) {
   await kvDel(k);
   return sessionId;
 }
+
+async function getSessionIdByPin(pin) {
+  return kvGet(pinKey(pin));
+}
+
 async function getSessionTtlSec(id) {
   return kvTtl(sessionKey(id));
 }
@@ -193,6 +198,7 @@ module.exports = {
   saveSession,
   deleteSession,
   resolvePinOnce,
+  getSessionIdByPin,
   getSessionTtlSec,
   setSessionExpireSoon,
   rateAllowResolve
