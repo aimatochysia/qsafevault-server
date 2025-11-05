@@ -183,6 +183,29 @@ async function rateAllowResolve(ip, max = 30, windowSec = 60) {
   return v <= max;
 }
 
+function deviceKey(userId, deviceId) { return `device:${userId}:${deviceId}`; }
+function deviceListKey(userId) { return `devices:list:${userId}`; }
+
+async function registerDevice(userId, deviceId, onion, port, ttlSec) {
+  const value = { userId, deviceId, onion, port, updatedAt: new Date().toISOString() };
+  await kvSet(deviceKey(userId, deviceId), value, ttlSec);
+  const listKey = deviceListKey(userId);
+  let list = await kvGet(listKey);
+  if (!Array.isArray(list)) list = [];
+  const idx = list.findIndex(x => x && x.deviceId === deviceId);
+  if (idx >= 0) list[idx] = { deviceId, onion, port };
+  else list.push({ deviceId, onion, port });
+  await kvSet(listKey, list, ttlSec);
+  return value;
+}
+
+async function listDevices(userId) {
+  const listKey = deviceListKey(userId);
+  let list = await kvGet(listKey);
+  if (Array.isArray(list) && list.length) return list;
+  return [];
+}
+
 module.exports = {
   createSession,
   getSession,
@@ -192,5 +215,7 @@ module.exports = {
   getSessionIdByPin,
   getSessionTtlSec,
   setSessionExpireSoon,
-  rateAllowResolve
+  rateAllowResolve,
+  registerDevice,
+  listDevices
 };
