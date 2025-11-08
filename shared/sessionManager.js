@@ -1,12 +1,12 @@
-const TTL_MS = Math.max(30000, Math.min(60000, Number(process.env.RELAY_TTL_MS || 60000)));
-const sessions = new Map();
+const redis = require('redis');
 
-function _key(pin, passwordHash) {
-  return `${pin}:${passwordHash}`;
-}
+const TTL_MS = Math.max(30000, Math.min(60000, Number(process.env.RELAY_TTL_MS || 60000)));
+const TTL_SEC = Math.ceil(TTL_MS / 1000);
+
+const sessions = new Map();
+function _key(pin, passwordHash) { return `${pin}:${passwordHash}`; }
 function _now() { return Date.now(); }
 function _expired(s) { return s.expiresAt <= _now(); }
-
 function cleanup() {
   const t = _now();
   for (const [k, s] of sessions) {
@@ -16,14 +16,46 @@ function cleanup() {
   }
 }
 
-function pushChunk({ pin, passwordHash, chunkIndex, totalChunks, data }) {
-  cleanup();
+const REDIS_URL = process.env.REDIS_URL || '';
+let _redisConnPromise = null;
+async function _getRedis() {
+  if (!REDIS_URL) return null;
+  if (_redisConnPromise) return _redisConnPromise;
+  const client = redis.createClient({ url: REDIS_URL });
+  client.on('error', (e) => console.error('[relay][redis] error', e));
+  _redisConnPromise = client.connect().then(() => client);
+  return _redisConnPromise;
+}
+function _rKeys(pin, passwordHash) {
+  const base = `qsv:relay:${pin}:${passwordHash}`;
+  return { meta: `${base}:meta`, chunks: `${base}:chunks` };
+}
+
+async function pushChunk({ pin, passwordHash, chunkIndex, totalChunks, data }) {
   if (typeof pin !== 'string' || !/^\d{6}$/.test(pin)) return { ok: false, error: 'invalid_pin' };
   if (typeof passwordHash !== 'string' || passwordHash.length < 8) return { ok: false, error: 'invalid_password_hash' };
   if (!Number.isInteger(chunkIndex) || chunkIndex < 0) return { ok: false, error: 'invalid_chunk_index' };
   if (!Number.isInteger(totalChunks) || totalChunks <= 0 || totalChunks > 10000) return { ok: false, error: 'invalid_total_chunks' };
   if (typeof data !== 'string' || data.length === 0) return { ok: false, error: 'invalid_data' };
 
+  const r = await _getRedis();
+  if (r) {
+    const { meta, chunks } = _rKeys(pin, passwordHash);
+    try {
+      await r.hSet(meta, { totalChunks: String(totalChunks) });
+      await r.expire(meta, TTL_SEC);
+      await r.hSetNX(chunks, String(chunkIndex), data);
+      await r.expire(chunks, TTL_SEC);
+      const receivedCount = await r.hLen(chunks);
+      const ttl = await r.ttl(meta);
+      const remaining = Math.max(0, totalChunks - receivedCount);
+      return { ok: true, remaining, ttlMs: (ttl > 0 ? ttl * 1000 : TTL_MS) };
+    } catch {
+      return { ok: false, error: 'internal_error' };
+    }
+  }
+
+  cleanup();
   const k = _key(pin, passwordHash);
   let s = sessions.get(k);
   const now = _now();
@@ -40,7 +72,6 @@ function pushChunk({ pin, passwordHash, chunkIndex, totalChunks, data }) {
     sessions.set(k, s);
   }
   if (_expired(s)) return { ok: false, error: 'expired' };
-
   s.totalChunks = totalChunks;
   if (!s.chunks.has(chunkIndex)) {
     s.chunks.set(chunkIndex, data);
@@ -52,7 +83,53 @@ function pushChunk({ pin, passwordHash, chunkIndex, totalChunks, data }) {
   return { ok: true, remaining, ttlMs: s.expiresAt - now };
 }
 
-function nextChunk({ pin, passwordHash }) {
+async function nextChunk({ pin, passwordHash }) {
+  const r = await _getRedis();
+  if (r) {
+    const { meta, chunks } = _rKeys(pin, passwordHash);
+    try {
+      const existsMeta = (await r.exists(meta)) === 1;
+      const existsChunks = (await r.exists(chunks)) === 1;
+
+      if (!existsMeta && !existsChunks) return { status: 'waiting' };
+      const ttl = await r.ttl(meta);
+      if (ttl <= 0) {
+        await r.del(meta);
+        await r.del(chunks);
+        return { status: 'expired' };
+      }
+
+      const keys = await r.hKeys(chunks);
+      if (keys.length === 0) {
+        const [deliveredRaw, totalRaw] = await r.hmGet(meta, ['deliveredCount', 'totalChunks']);
+        const delivered = parseInt(deliveredRaw || '0', 10) || 0;
+        const total = parseInt(totalRaw || '0', 10) || 0;
+        if (total > 0 && delivered >= total) {
+          await r.del(meta);
+          await r.del(chunks);
+          return { status: 'done' };
+        }
+        return { status: 'waiting' };
+      }
+
+      const idx = keys.map((k) => parseInt(k, 10)).sort((a, b) => a - b)[0];
+      const field = String(idx);
+      const data = await r.hGet(chunks, field);
+      if (data == null) return { status: 'waiting' };
+
+      await r.hDel(chunks, field);
+      await r.hIncrBy(meta, 'deliveredCount', 1);
+      await r.expire(meta, TTL_SEC);
+      await r.expire(chunks, TTL_SEC);
+
+      const totalRaw = await r.hGet(meta, 'totalChunks');
+      const totalChunks = parseInt(totalRaw || '0', 10) || 0;
+      return { status: 'chunkAvailable', chunk: { chunkIndex: idx, totalChunks, data } };
+    } catch {
+      return { status: 'expired' };
+    }
+  }
+
   cleanup();
   const s = sessions.get(_key(pin, passwordHash));
   if (!s) return { status: 'waiting' };
@@ -74,15 +151,7 @@ function nextChunk({ pin, passwordHash }) {
   s.deliveredCount += 1;
   s.updatedAt = _now();
   s.expiresAt = s.updatedAt + TTL_MS;
-
-  return {
-    status: 'chunkAvailable',
-    chunk: {
-      chunkIndex: idx,
-      totalChunks: s.totalChunks,
-      data
-    }
-  };
+  return { status: 'chunkAvailable', chunk: { chunkIndex: idx, totalChunks: s.totalChunks, data } };
 }
 
 module.exports = {
