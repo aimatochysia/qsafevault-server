@@ -1,30 +1,48 @@
-const { pushChunk, cleanup } = require('../shared/sessionManager');
+const { pushChunk, purgeExpired } = require('../sessionManager');
 
-module.exports = async function handler(req, res) {
+function parseJson(req, maxSize = 70 * 1024) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => {
+      body += chunk;
+      if (body.length > maxSize) {
+        req.destroy();
+        reject({ error: 'body_too_large', status: 'waiting' });
+      }
+    });
+    req.on('end', () => {
+      try {
+        const json = JSON.parse(body);
+        resolve(json);
+      } catch (e) {
+        reject({ error: 'invalid_json', status: 'waiting' });
+      }
+    });
+  });
+}
+
+module.exports = async function sendHandler(req, res) {
   if (req.method !== 'POST') {
     res.statusCode = 405;
-    return res.end(JSON.stringify({ error: 'method_not_allowed' }));
+    res.end();
+    return;
   }
+  purgeExpired();
+  let input;
   try {
-    let body = '';
-    await new Promise((resolve) => {
-      req.on('data', (c) => (body += c.toString()));
-      req.on('end', resolve);
-    });
-    let obj = {};
-    try { obj = JSON.parse(body || '{}'); } catch { obj = {}; }
-
-    const { pin, passwordHash, chunkIndex, totalChunks, data } = obj || {};
-    const r = await pushChunk({ pin, passwordHash, chunkIndex, totalChunks, data });
-    cleanup();
-    if (!r.ok) {
-      res.statusCode = 400;
-      return res.end(JSON.stringify({ status: r.error === 'expired' ? 'expired' : 'waiting', error: r.error }));
-    }
-    res.statusCode = 200;
-    res.end(JSON.stringify({ status: 'waiting', remaining: r.remaining, ttlMs: r.ttlMs }));
-  } catch {
-    res.statusCode = 500;
-    res.end(JSON.stringify({ status: 'expired', error: 'internal_error' }));
+    input = await parseJson(req);
+  } catch (err) {
+    res.statusCode = 400;
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.end(JSON.stringify(err));
+    return;
   }
+  const result = pushChunk(input);
+  if (result.error) {
+    res.statusCode = 400;
+  } else {
+    res.statusCode = 200;
+  }
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.end(JSON.stringify(result));
 };

@@ -1,24 +1,21 @@
-const { nextChunk, cleanup } = require('../shared/sessionManager');
+const { nextChunk, purgeExpired } = require('../sessionManager');
 
-module.exports = async function handler(req, res) {
+module.exports = function receiveHandler(req, res) {
   if (req.method !== 'GET') {
     res.statusCode = 405;
-    return res.end(JSON.stringify({ error: 'method_not_allowed' }));
+    res.end();
+    return;
   }
-  try {
-    const pin = (req.query && (req.query.pin || '')).toString();
-    const passwordHash = (req.query && (req.query.passwordHash || '')).toString();
-
-    const out = await nextChunk({ pin, passwordHash });
-    cleanup();
-
-    res.statusCode = 200;
-    if (out.status === 'chunkAvailable') {
-      return res.end(JSON.stringify({ status: out.status, chunk: out.chunk }));
-    }
-    return res.end(JSON.stringify({ status: out.status }));
-  } catch {
-    res.statusCode = 500;
-    res.end(JSON.stringify({ status: 'expired', error: 'internal_error' }));
+  purgeExpired();
+  const { pin, passwordHash } = req.query || {};
+  if (typeof pin !== 'string' || typeof passwordHash !== 'string') {
+    res.statusCode = 400;
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.end(JSON.stringify({ status: 'waiting', error: 'missing_pin_or_passwordHash' }));
+    return;
   }
+  const result = nextChunk({ pin, passwordHash });
+  res.statusCode = 200;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.end(JSON.stringify(result));
 };

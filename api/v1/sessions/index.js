@@ -1,23 +1,24 @@
-const crypto = require('crypto');
-const { v4: uuidv4 } = require('uuid');
-const { SESS_TTL_SEC, sendJson, error } = require('../../_lib/utils');
-const { createSession } = require('../../_lib/store');
+const { createSession } = require('./sessionStore');
 
-module.exports = async function handler(req, res) {
-  if (req.method !== 'POST') return error(res, 405, 'method_not_allowed');
-  try {
-    const id = uuidv4();
-    const saltB64 = crypto.randomBytes(16).toString('base64');
-    const { session, pin } = await createSession(id, saltB64, SESS_TTL_SEC);
-    sendJson(res, 200, {
-      sessionId: session.id,
-      pin,
-      saltB64: session.saltB64,
-      ttlSec: SESS_TTL_SEC,
-      createdAt: session.createdAt,
-      expiresAt: session.expiresAt
-    });
-  } catch {
-    error(res, 500, 'internal_error');
+module.exports = function sessionsIndex(req, res) {
+  if (req.method !== 'POST') {
+    res.statusCode = 405;
+    res.end();
+    return;
   }
+  let body = '';
+  req.on('data', chunk => {
+    body += chunk;
+    if (body.length > 4096) req.destroy();
+  });
+  req.on('end', () => {
+    let pin;
+    try {
+      if (body) pin = JSON.parse(body).pin;
+    } catch {}
+    const result = createSession(pin);
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.end(JSON.stringify(result));
+  });
 };

@@ -1,13 +1,23 @@
-const { isUuidV4, error } = require('../../../_lib/utils');
-const { deleteSession } = require('../../../_lib/store');
+// DELETE /api/v1/sessions/[sessionId]
+const { getSession, saveSession } = require('../sessionStore');
 
-module.exports = async function handler(req, res) {
-  if (req.method !== 'DELETE') return error(res, 405, 'method_not_allowed');
-
-  const { sessionId } = req.query;
-  if (!isUuidV4(sessionId)) return error(res, 404, 'session_not_found');
-
-  await deleteSession(sessionId);
-  res.statusCode = 204;
-  res.end();
+module.exports = function sessionDelete(req, res) {
+  if (req.method !== 'DELETE') {
+    res.statusCode = 405;
+    res.end();
+    return;
+  }
+  const sessionId = req.query.sessionId;
+  const sess = getSession(sessionId);
+  if (!sess) {
+    res.statusCode = 410;
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.end(JSON.stringify({ error: 'session_expired' }));
+    return;
+  }
+  // Mark as deleted (ephemeral, just remove from store)
+  saveSession(sessionId, { offer: null, answer: null });
+  res.statusCode = 200;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.end(JSON.stringify({ status: 'deleted' }));
 };
