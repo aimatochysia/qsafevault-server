@@ -1,7 +1,8 @@
-const http = require('http');
-const url = require('url');
 
-// Handlers
+const express = require('express');
+const app = express();
+app.use(express.json({ limit: '70kb' }));
+
 const sendHandler = require('./api/send');
 const receiveHandler = require('./api/receive');
 const sessionsIndex = require('./api/v1/sessions/index');
@@ -9,51 +10,50 @@ const sessionsResolve = require('./api/v1/sessions/resolve');
 const sessionOffer = require('./api/v1/sessions/[sessionId]/offer');
 const sessionAnswer = require('./api/v1/sessions/[sessionId]/answer');
 const sessionDelete = require('./api/v1/sessions/[sessionId]/index');
+const registerDevice = require('./api/v1/devices/index').registerDevice;
+const listDevices = require('./api/v1/devices/[userId]');
 
-// Helper to attach query and params like Vercel
-function attachQuery(req, parsed) {
-  req.query = parsed.query || {};
-}
-function route(req, res) {
-  const parsed = url.parse(req.url, true);
-  let path = parsed.pathname || '/';
+app.post('/api/send', sendHandler);
+app.get('/api/receive', receiveHandler);
 
-  if (path.startsWith('/v1/')) path = path.replace(/^\/v1\//, '/api/v1/');
+app.post('/api/v1/sessions', sessionsIndex);
+app.get('/api/v1/sessions/resolve', sessionsResolve);
+app.post('/api/v1/sessions/:sessionId/offer', (req, res) => {
+  req.query = { ...req.query, sessionId: req.params.sessionId };
+  sessionOffer(req, res);
+});
+app.get('/api/v1/sessions/:sessionId/offer', (req, res) => {
+  req.query = { ...req.query, sessionId: req.params.sessionId };
+  sessionOffer(req, res);
+});
+app.post('/api/v1/sessions/:sessionId/answer', (req, res) => {
+  req.query = { ...req.query, sessionId: req.params.sessionId };
+  sessionAnswer(req, res);
+});
+app.get('/api/v1/sessions/:sessionId/answer', (req, res) => {
+  req.query = { ...req.query, sessionId: req.params.sessionId };
+  sessionAnswer(req, res);
+});
+app.delete('/api/v1/sessions/:sessionId', (req, res) => {
+  req.query = { ...req.query, sessionId: req.params.sessionId };
+  sessionDelete(req, res);
+});
 
-  attachQuery(req, parsed);
+app.post('/api/v1/devices', registerDevice);
+app.get('/api/v1/devices/:userId', (req, res) => {
+  req.query = { ...req.query, userId: req.params.userId };
+  listDevices(req, res);
+});
 
-  if (path === '/api/send') return sendHandler(req, res);
-  if (path === '/api/receive') return receiveHandler(req, res);
-
-  if (path === '/api/v1/sessions' && req.method === 'POST') return sessionsIndex(req, res);
-  if (path === '/api/v1/sessions/resolve') return sessionsResolve(req, res);
-
-  const offerMatch = path.match(/^\/api\/v1\/sessions\/([0-9a-f-]{36})\/offer$/i);
-  if (offerMatch) {
-    req.query = Object.assign({}, req.query, { sessionId: offerMatch[1] });
-    return sessionOffer(req, res);
-  }
-  const answerMatch = path.match(/^\/api\/v1\/sessions\/([0-9a-f-]{36})\/answer$/i);
-  if (answerMatch) {
-    req.query = Object.assign({}, req.query, { sessionId: answerMatch[1] });
-    return sessionAnswer(req, res);
-  }
-  const delMatch = path.match(/^\/api\/v1\/sessions\/([0-9a-f-]{36})$/i);
-  if (delMatch) {
-    req.query = Object.assign({}, req.query, { sessionId: delMatch[1] });
-    return sessionDelete(req, res);
-  }
-
-  res.statusCode = 404;
-  res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.end(JSON.stringify({ error: 'not_found' }));
-}
+app.use((req, res) => {
+  res.status(404).json({ error: 'not_found' });
+});
 
 const port = process.env.PORT || 3000;
 if (require.main === module) {
-  http.createServer(route).listen(port, () => {
+  app.listen(port, () => {
     console.log(`qsafevault-server listening on http://localhost:${port}`);
   });
 }
 
-module.exports = { route };
+module.exports = app;
