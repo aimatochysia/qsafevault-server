@@ -9,7 +9,7 @@ module.exports = async function handler(req, res) {
     const pin = (req.query && (req.query.pin || '')).toString();
     const passwordHash = (req.query && (req.query.passwordHash || '')).toString();
 
-    const out = nextChunk({ pin, passwordHash });
+    const out = await nextChunk({ pin, passwordHash });
     cleanup();
 
     res.statusCode = 200;

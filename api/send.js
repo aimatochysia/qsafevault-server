@@ -15,14 +15,14 @@ module.exports = async function handler(req, res) {
     try { obj = JSON.parse(body || '{}'); } catch { obj = {}; }
 
     const { pin, passwordHash, chunkIndex, totalChunks, data } = obj || {};
-    const r = pushChunk({ pin, passwordHash, chunkIndex, totalChunks, data });
+    const r = await pushChunk({ pin, passwordHash, chunkIndex, totalChunks, data });
     cleanup();
     if (!r.ok) {
       res.statusCode = 400;
       return res.end(JSON.stringify({ status: r.error === 'expired' ? 'expired' : 'waiting', error: r.error }));
     }
     res.statusCode = 200;
-    res.end(JSON.stringify({ status: 'waiting' }));
+    res.end(JSON.stringify({ status: 'waiting', remaining: r.remaining, ttlMs: r.ttlMs }));
   } catch {
     res.statusCode = 500;
     res.end(JSON.stringify({ status: 'expired', error: 'internal_error' }));
