@@ -107,4 +107,18 @@ async function nextChunk({ pin, passwordHash }) {
   return { status: 'waiting' };
 }
 
-module.exports = { pushChunk, nextChunk, purgeExpired, TTL_MS };
+async function setAcknowledged(pin, passwordHash) {
+  const redis = getRedisClient();
+  const sKey = sessionKey(pin, passwordHash);
+  await redis.hSet(sKey, { acknowledged: '1', lastTouched: Date.now() });
+  await redis.expire(sKey, TTL_SEC);
+}
+
+async function getAcknowledged(pin, passwordHash) {
+  const redis = getRedisClient();
+  const sKey = sessionKey(pin, passwordHash);
+  const sess = await redis.hGetAll(sKey);
+  return sess && sess.acknowledged === '1';
+}
+
+module.exports = { pushChunk, nextChunk, purgeExpired, TTL_MS, setAcknowledged, getAcknowledged };
