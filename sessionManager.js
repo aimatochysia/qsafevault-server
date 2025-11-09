@@ -1,29 +1,21 @@
 
-const TTL_MS = 45000;
-const CLEANUP_INTERVAL = 10000;
 
-const sessions = new Map();
+const { getRedisClient } = require('./redisClient');
+const TTL_MS = 45000;
+const TTL_SEC = Math.ceil(TTL_MS / 1000);
 
 function sessionKey(pin, passwordHash) {
-  return `${pin}:${passwordHash}`;
+  return `qsv:session:${pin}:${passwordHash}`;
 }
 
-function now() {
-  return Date.now();
+function chunkKey(pin, passwordHash, chunkIndex) {
+  return `qsv:chunk:${pin}:${passwordHash}:${chunkIndex}`;
 }
 
-function purgeExpired() {
-  const cutoff = now() - TTL_MS;
-  for (const [key, sess] of sessions.entries()) {
-    if (sess.lastTouched < cutoff) {
-      sessions.delete(key);
-    }
-  }
+async function purgeExpired() {
 }
 
-setInterval(purgeExpired, CLEANUP_INTERVAL);
-
-function pushChunk({ pin, passwordHash, chunkIndex, totalChunks, data }) {
+async function pushChunk({ pin, passwordHash, chunkIndex, totalChunks, data }) {
   if (
     typeof pin !== 'string' ||
     typeof passwordHash !== 'string' ||
@@ -38,60 +30,78 @@ function pushChunk({ pin, passwordHash, chunkIndex, totalChunks, data }) {
   ) {
     return { error: 'invalid_chunk', status: 'waiting' };
   }
-  const key = sessionKey(pin, passwordHash);
-  let sess = sessions.get(key);
-  if (!sess) {
-    sess = {
-      created: now(),
-      lastTouched: now(),
+  const redis = getRedisClient();
+  const sKey = sessionKey(pin, passwordHash);
+  const cKey = chunkKey(pin, passwordHash, chunkIndex);
+  let sess = await redis.hGetAll(sKey);
+  if (!sess || !sess.totalChunks) {
+    await redis.hSet(sKey, {
+      created: Date.now(),
+      lastTouched: Date.now(),
       totalChunks,
-      chunks: new Map(),
-      delivered: new Set(),
-    };
-    sessions.set(key, sess);
+      delivered: JSON.stringify([]),
+    });
+    await redis.expire(sKey, TTL_SEC);
   } else {
-    if (sess.totalChunks !== totalChunks) {
+    if (parseInt(sess.totalChunks) !== totalChunks) {
       return { error: 'totalChunks_mismatch', status: 'waiting' };
     }
-    if (sess.chunks.has(chunkIndex) || sess.delivered.has(chunkIndex)) {
+    const delivered = JSON.parse(sess.delivered || '[]');
+    if (delivered.includes(chunkIndex)) {
+      return { error: 'duplicate_chunk', status: 'waiting' };
+    }
+    if (await redis.exists(cKey)) {
       return { error: 'duplicate_chunk', status: 'waiting' };
     }
   }
-  sess.chunks.set(chunkIndex, data);
-  sess.lastTouched = now();
-  purgeExpired();
+  await redis.set(cKey, data, { EX: TTL_SEC });
+  await redis.hSet(sKey, { lastTouched: Date.now() });
+  await redis.expire(sKey, TTL_SEC);
   return { status: 'waiting' };
 }
 
-function nextChunk({ pin, passwordHash }) {
-  const key = sessionKey(pin, passwordHash);
-  const sess = sessions.get(key);
-  if (!sess) {
+async function nextChunk({ pin, passwordHash }) {
+  const redis = getRedisClient();
+  const sKey = sessionKey(pin, passwordHash);
+  const sess = await redis.hGetAll(sKey);
+  if (!sess || !sess.totalChunks) {
     return { status: 'expired' };
   }
-  if (now() - sess.lastTouched > TTL_MS) {
-    sessions.delete(key);
+  const lastTouched = parseInt(sess.lastTouched || '0');
+  if (Date.now() - lastTouched > TTL_MS) {
+    await redis.del(sKey);
+    for (let i = 0; i < parseInt(sess.totalChunks); ++i) {
+      await redis.del(chunkKey(pin, passwordHash, i));
+    }
     return { status: 'expired' };
   }
-  const pending = Array.from(sess.chunks.keys()).sort((a, b) => a - b);
-  if (pending.length > 0) {
-    const chunkIndex = pending[0];
-    const data = sess.chunks.get(chunkIndex);
-    sess.chunks.delete(chunkIndex);
-    sess.delivered.add(chunkIndex);
-    sess.lastTouched = now();
-    purgeExpired();
-    return {
-      status: 'chunkAvailable',
-      chunk: {
-        chunkIndex,
-        totalChunks: sess.totalChunks,
-        data,
-      },
-    };
+  let found = null;
+  for (let i = 0; i < parseInt(sess.totalChunks); ++i) {
+    const cKey = chunkKey(pin, passwordHash, i);
+    const data = await redis.get(cKey);
+    if (data) {
+      found = { chunkIndex: i, data };
+      await redis.del(cKey);
+      let delivered = JSON.parse(sess.delivered || '[]');
+      delivered.push(i);
+      await redis.hSet(sKey, { delivered: JSON.stringify(delivered), lastTouched: Date.now() });
+      await redis.expire(sKey, TTL_SEC);
+      return {
+        status: 'chunkAvailable',
+        chunk: {
+          chunkIndex: i,
+          totalChunks: parseInt(sess.totalChunks),
+          data,
+        },
+      };
+    }
   }
-  if (sess.delivered.size === sess.totalChunks) {
-    sessions.delete(key);
+  let delivered = JSON.parse(sess.delivered || '[]');
+  if (delivered.length === parseInt(sess.totalChunks)) {
+    await redis.del(sKey);
+    for (let i = 0; i < parseInt(sess.totalChunks); ++i) {
+      await redis.del(chunkKey(pin, passwordHash, i));
+    }
     return { status: 'done' };
   }
   return { status: 'waiting' };
