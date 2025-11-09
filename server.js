@@ -3,10 +3,7 @@ const express = require('express');
 const app = express();
 app.use(express.json({ limit: '70kb' }));
 
-const sendHandler = require('./api/send');
-const receiveHandler = require('./api/receive');
-const ackHandler = require('./api/ack');
-const ackStatusHandler = require('./api/ack-status');
+const relayHandler = require('./api/relay');
 const sessionsIndex = require('./api/v1/sessions/index');
 const sessionsResolve = require('./api/v1/sessions/resolve');
 const sessionOffer = require('./api/v1/sessions/[sessionId]/offer');
@@ -15,10 +12,7 @@ const sessionDelete = require('./api/v1/sessions/[sessionId]/index');
 const registerDevice = require('./api/v1/devices/index').registerDevice;
 const listDevices = require('./api/v1/devices/[userId]');
 
-app.post('/api/send', sendHandler);
-app.get('/api/receive', receiveHandler);
-app.post('/api/ack', ackHandler);
-app.post('/api/ack-status', ackStatusHandler);
+app.all('/api/relay', relayHandler);
 
 app.post('/api/v1/sessions', sessionsIndex);
 app.get('/api/v1/sessions/resolve', sessionsResolve);
