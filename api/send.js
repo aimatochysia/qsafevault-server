@@ -1,5 +1,4 @@
 const { pushChunk, purgeExpired } = require('../sessionManager');
-const { logEvent } = require('../debugLogger');
 
 function parseJson(req, maxSize = 70 * 1024) {
   return new Promise((resolve, reject) => {
@@ -36,11 +35,9 @@ module.exports = async function sendHandler(req, res) {
     res.statusCode = 400;
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.end(JSON.stringify(err));
-    await logEvent({ type: 'send', error: err, reqBody: null });
     return;
   }
   const result = await pushChunk(input);
-  await logEvent({ type: 'send', reqBody: input, result });
   if (result.error) {
     res.statusCode = 400;
   } else {

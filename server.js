@@ -1,9 +1,3 @@
-const { getLog } = require('./debugLogger');
-app.get('/api/debuglog', async (req, res) => {
-  const log = await getLog();
-  res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.end(JSON.stringify(log));
-});
 
 const express = require('express');
 const app = express();
