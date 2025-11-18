@@ -1,7 +1,10 @@
 
 
 const { getRedisClient } = require('./redisClient');
-const TTL_MS = 45000;
+
+// TTL increased to 60s to support bidirectional relay scenarios
+// where user interaction may be required between transfers
+const TTL_MS = 60000;
 const TTL_SEC = Math.ceil(TTL_MS / 1000);
 
 function sessionKey(pin, passwordHash) {
@@ -10,6 +13,11 @@ function sessionKey(pin, passwordHash) {
 
 function chunkKey(pin, passwordHash, chunkIndex) {
   return `qsv:chunk:${pin}:${passwordHash}:${chunkIndex}`;
+}
+
+// Separate key for acknowledgment to persist after session deletion
+function ackKey(pin, passwordHash) {
+  return `qsv:ack:${pin}:${passwordHash}`;
 }
 
 async function purgeExpired() {
@@ -75,6 +83,22 @@ async function nextChunk({ pin, passwordHash }) {
     }
     return { status: 'expired' };
   }
+  
+  // If already completed, check if acknowledged
+  if (sess.completed === '1') {
+    const aKey = ackKey(pin, passwordHash);
+    const isAcknowledged = await redis.get(aKey);
+    if (isAcknowledged === '1') {
+      // Clean up session after acknowledgment
+      await redis.del(sKey);
+      for (let i = 0; i < parseInt(sess.totalChunks); ++i) {
+        await redis.del(chunkKey(pin, passwordHash, i));
+      }
+      await redis.del(aKey);
+    }
+    return { status: 'done' };
+  }
+  
   let found = null;
   for (let i = 0; i < parseInt(sess.totalChunks); ++i) {
     const cKey = chunkKey(pin, passwordHash, i);
@@ -96,9 +120,15 @@ async function nextChunk({ pin, passwordHash }) {
       };
     }
   }
+  
+  // Check if all chunks have been delivered
   let delivered = JSON.parse(sess.delivered || '[]');
   if (delivered.length === parseInt(sess.totalChunks)) {
-    await redis.del(sKey);
+    // Mark session as completed but keep it alive for acknowledgment
+    // Session will be cleaned up when acknowledged or TTL expires
+    await redis.hSet(sKey, { completed: '1', lastTouched: Date.now() });
+    await redis.expire(sKey, TTL_SEC);
+    // Clean up remaining chunk keys (should already be deleted)
     for (let i = 0; i < parseInt(sess.totalChunks); ++i) {
       await redis.del(chunkKey(pin, passwordHash, i));
     }
@@ -107,15 +137,32 @@ async function nextChunk({ pin, passwordHash }) {
   return { status: 'waiting' };
 }
 
+// Set acknowledgment using a separate key that persists beyond session deletion
+// This allows bidirectional transfers to confirm receipt even after completion
 async function setAcknowledged(pin, passwordHash) {
   const redis = getRedisClient();
+  const aKey = ackKey(pin, passwordHash);
+  await redis.set(aKey, '1', { EX: TTL_SEC });
+  
+  // Also update session if it still exists
   const sKey = sessionKey(pin, passwordHash);
-  await redis.hSet(sKey, { acknowledged: '1', lastTouched: Date.now() });
-  await redis.expire(sKey, TTL_SEC);
+  const sess = await redis.hGetAll(sKey);
+  if (sess && sess.totalChunks) {
+    await redis.hSet(sKey, { acknowledged: '1', lastTouched: Date.now() });
+    await redis.expire(sKey, TTL_SEC);
+  }
 }
 
+// Check acknowledgment from separate ack key (persists after session deletion)
 async function getAcknowledged(pin, passwordHash) {
   const redis = getRedisClient();
+  const aKey = ackKey(pin, passwordHash);
+  const ackValue = await redis.get(aKey);
+  if (ackValue === '1') {
+    return true;
+  }
+  
+  // Fallback: check session hash if ack key not found
   const sKey = sessionKey(pin, passwordHash);
   const sess = await redis.hGetAll(sKey);
   return sess && sess.acknowledged === '1';
