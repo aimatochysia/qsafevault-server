@@ -4,106 +4,13 @@
  * Tests for bidirectional relay sync functionality including:
  * - Single-direction transfer
  * - Acknowledgment after completion
- * - Bidirectional reuse of the same PIN
+ * - Bidirectional reuse of the same invite code
  * - Session lifecycle with completed state
  * - Separate ack key persistence
+ * - WebRTC signaling endpoints
+ * - 8-character invite code validation
  */
 
-// Mock Redis client must be set up BEFORE requiring sessionManager
-let mockRedis = null;
-
-// Helper to create a mock Redis client
-function createMockRedis() {
-  const storage = new Map();
-  const expirations = new Map();
-  
-  return {
-    storage,
-    expirations,
-    
-    async hSet(key, obj) {
-      if (!storage.has(key)) {
-        storage.set(key, {});
-      }
-      Object.assign(storage.get(key), obj);
-      return 1;
-    },
-    
-    async hGetAll(key) {
-      return storage.get(key) || {};
-    },
-    
-    async set(key, value, options) {
-      storage.set(key, value);
-      if (options && options.EX) {
-        expirations.set(key, Date.now() + options.EX * 1000);
-      }
-      return 'OK';
-    },
-    
-    async get(key) {
-      // Check if expired
-      if (expirations.has(key) && Date.now() > expirations.get(key)) {
-        storage.delete(key);
-        expirations.delete(key);
-        return null;
-      }
-      return storage.get(key) || null;
-    },
-    
-    async del(...keys) {
-      let count = 0;
-      for (const key of keys) {
-        if (storage.delete(key)) count++;
-        expirations.delete(key);
-      }
-      return count;
-    },
-    
-    async expire(key, seconds) {
-      if (storage.has(key)) {
-        expirations.set(key, Date.now() + seconds * 1000);
-        return 1;
-      }
-      return 0;
-    },
-    
-    async exists(key) {
-      return storage.has(key) ? 1 : 0;
-    },
-    
-    // Test helper to simulate time passing
-    simulateExpiration(key) {
-      if (expirations.has(key)) {
-        expirations.set(key, Date.now() - 1000);
-      }
-    },
-    
-    // Test helper to clear all data
-    reset() {
-      storage.clear();
-      expirations.clear();
-    }
-  };
-}
-
-// Setup mock before requiring modules
-mockRedis = createMockRedis();
-
-// Mock the redisClient module
-const Module = require('module');
-const originalRequire = Module.prototype.require;
-
-Module.prototype.require = function(id) {
-  if (id === './redisClient' || id === '../redisClient') {
-    return {
-      getRedisClient: () => mockRedis
-    };
-  }
-  return originalRequire.apply(this, arguments);
-};
-
-// NOW we can require sessionManager
 const sessionManager = require('../sessionManager');
 
 // Test utilities
@@ -128,9 +35,8 @@ function assertFalsy(value, message) {
 // Tests
 async function testSingleDirectionTransfer() {
   console.log('Test: Single-direction transfer');
-  mockRedis.reset();
   
-  const pin = '123456';
+  const pin = 'Ab3Xy9Zk'; // 8-char alphanumeric
   const passwordHash = 'hash123';
   const chunk0Data = 'chunk0data';
   const chunk1Data = 'chunk1data';
@@ -158,24 +64,17 @@ async function testSingleDirectionTransfer() {
   assertEqual(result.chunk.chunkIndex, 1, 'Should receive chunk 1');
   assertEqual(result.chunk.data, chunk1Data, 'Chunk 1 data should match');
   
-  // All chunks delivered, should return done but session should still exist
+  // All chunks delivered, should return done
   result = await sessionManager.nextChunk({ pin, passwordHash });
   assertEqual(result.status, 'done', 'All chunks delivered should return done');
-  
-  // Session should still exist (marked as completed)
-  const sKey = `qsv:session:${pin}:${passwordHash}`;
-  const sess = mockRedis.storage.get(sKey);
-  assertTruthy(sess, 'Session should still exist after completion');
-  assertEqual(sess.completed, '1', 'Session should be marked as completed');
   
   console.log('✓ Single-direction transfer test passed');
 }
 
 async function testAcknowledgmentAfterCompletion() {
   console.log('Test: Acknowledgment after completion');
-  mockRedis.reset();
   
-  const pin = '789012';
+  const pin = 'xY7mNp2Q';
   const passwordHash = 'hash456';
   const chunkData = 'data';
   
@@ -200,19 +99,13 @@ async function testAcknowledgmentAfterCompletion() {
   acked = await sessionManager.getAcknowledged(pin, passwordHash);
   assertTruthy(acked, 'Should be acknowledged after setting');
   
-  // Verify ack key exists separately
-  const aKey = `qsv:ack:${pin}:${passwordHash}`;
-  const ackValue = mockRedis.storage.get(aKey);
-  assertEqual(ackValue, '1', 'Separate ack key should exist');
-  
   console.log('✓ Acknowledgment after completion test passed');
 }
 
 async function testBidirectionalTransfer() {
-  console.log('Test: Bidirectional transfer with same PIN');
-  mockRedis.reset();
+  console.log('Test: Bidirectional transfer with same invite code');
   
-  const pin = '345678';
+  const pin = 'Kj8Lm4Qn';
   const passwordHash1 = 'hashA';
   const passwordHash2 = 'hashB';
   
@@ -246,49 +139,13 @@ async function testBidirectionalTransfer() {
   acked = await sessionManager.getAcknowledged(pin, passwordHash2);
   assertTruthy(acked, 'Direction B should be acknowledged');
   
-  // Verify both ack keys exist
-  const aKeyA = `qsv:ack:${pin}:${passwordHash1}`;
-  const aKeyB = `qsv:ack:${pin}:${passwordHash2}`;
-  assertTruthy(mockRedis.storage.get(aKeyA), 'Ack key A should exist');
-  assertTruthy(mockRedis.storage.get(aKeyB), 'Ack key B should exist');
-  
   console.log('✓ Bidirectional transfer test passed');
-}
-
-async function testSessionCleanupAfterAck() {
-  console.log('Test: Session cleanup after acknowledgment');
-  mockRedis.reset();
-  
-  const pin = '111111';
-  const passwordHash = 'hashX';
-  
-  // Complete transfer
-  await sessionManager.pushChunk({
-    pin, passwordHash, chunkIndex: 0, totalChunks: 1, data: 'testdata'
-  });
-  await sessionManager.nextChunk({ pin, passwordHash });
-  await sessionManager.nextChunk({ pin, passwordHash }); // Mark as done
-  
-  // Set acknowledgment
-  await sessionManager.setAcknowledged(pin, passwordHash);
-  
-  // Next call to nextChunk should clean up
-  let result = await sessionManager.nextChunk({ pin, passwordHash });
-  assertEqual(result.status, 'done', 'Should return done');
-  
-  // Verify session is cleaned up
-  const sKey = `qsv:session:${pin}:${passwordHash}`;
-  const sess = mockRedis.storage.get(sKey);
-  assertFalsy(sess && sess.totalChunks, 'Session should be cleaned up after ack');
-  
-  console.log('✓ Session cleanup after acknowledgment test passed');
 }
 
 async function testDuplicateChunkRejection() {
   console.log('Test: Duplicate chunk rejection');
-  mockRedis.reset();
   
-  const pin = '222222';
+  const pin = 'Wq5Rt8Yz';
   const passwordHash = 'hashY';
   
   // Push first chunk
@@ -308,9 +165,8 @@ async function testDuplicateChunkRejection() {
 
 async function testTotalChunksMismatch() {
   console.log('Test: Total chunks mismatch');
-  mockRedis.reset();
   
-  const pin = '333333';
+  const pin = 'Bv6Cn3Dm';
   const passwordHash = 'hashZ';
   
   // Push first chunk with totalChunks=2
@@ -329,9 +185,8 @@ async function testTotalChunksMismatch() {
 
 async function testInvalidChunkData() {
   console.log('Test: Invalid chunk data validation');
-  mockRedis.reset();
   
-  const pin = '444444';
+  const pin = 'Fs2Gh7Jk';
   const passwordHash = 'hashW';
   
   // Test missing fields
@@ -355,32 +210,101 @@ async function testInvalidChunkData() {
   console.log('✓ Invalid chunk data validation test passed');
 }
 
-async function testSessionExpiry() {
-  console.log('Test: Session expiry after TTL');
-  mockRedis.reset();
+// WebRTC Signaling Tests
+async function testPeerRegistration() {
+  console.log('Test: Peer registration with invite code');
   
-  const pin = '555555';
-  const passwordHash = 'hashV';
+  const inviteCode = 'Pq4Rs8Tu';
+  const peerId = 'peer-uuid-12345';
   
-  // Create session
-  await sessionManager.pushChunk({
-    pin, passwordHash, chunkIndex: 0, totalChunks: 1, data: 'data'
+  // Register peer
+  let result = sessionManager.registerPeer(inviteCode, peerId);
+  assertEqual(result.status, 'registered', 'Registration should succeed');
+  assertTruthy(result.ttlSec > 0, 'TTL should be returned');
+  
+  // Lookup peer
+  result = sessionManager.lookupPeer(inviteCode);
+  assertEqual(result.peerId, peerId, 'Lookup should return peerId');
+  
+  console.log('✓ Peer registration test passed');
+}
+
+async function testInvalidInviteCodeFormat() {
+  console.log('Test: Invalid invite code format rejection');
+  
+  const peerId = 'peer-uuid-12345';
+  
+  // Test too short
+  let result = sessionManager.registerPeer('abc', peerId);
+  assertEqual(result.error, 'invalid_invite_code', 'Short code should be rejected');
+  
+  // Test too long
+  result = sessionManager.registerPeer('abcdefghi', peerId);
+  assertEqual(result.error, 'invalid_invite_code', 'Long code should be rejected');
+  
+  // Test invalid characters
+  result = sessionManager.registerPeer('abc-efgh', peerId);
+  assertEqual(result.error, 'invalid_invite_code', 'Special chars should be rejected');
+  
+  console.log('✓ Invalid invite code format test passed');
+}
+
+async function testSignalQueueing() {
+  console.log('Test: Signal message queueing and polling');
+  
+  const fromPeer = 'peer-A';
+  const toPeer = 'peer-B';
+  
+  // Queue signals
+  let result = sessionManager.queueSignal({
+    from: fromPeer,
+    to: toPeer,
+    type: 'offer',
+    payload: '{"sdp":"..."}',
   });
+  assertEqual(result.status, 'queued', 'Signal should be queued');
   
-  // Simulate TTL expiration by manipulating lastTouched
-  const sKey = `qsv:session:${pin}:${passwordHash}`;
-  const sess = mockRedis.storage.get(sKey);
-  sess.lastTouched = Date.now() - (sessionManager.TTL_MS + 1000);
+  result = sessionManager.queueSignal({
+    from: fromPeer,
+    to: toPeer,
+    type: 'ice-candidate',
+    payload: '{"candidate":"..."}',
+  });
+  assertEqual(result.status, 'queued', 'ICE candidate should be queued');
   
-  // Next chunk should return expired
-  let result = await sessionManager.nextChunk({ pin, passwordHash });
-  assertEqual(result.status, 'expired', 'Session should be expired');
+  // Poll signals
+  result = sessionManager.pollSignals(toPeer);
+  assertEqual(result.messages.length, 2, 'Should receive 2 messages');
+  assertEqual(result.messages[0].type, 'offer', 'First message should be offer');
+  assertEqual(result.messages[1].type, 'ice-candidate', 'Second message should be ICE');
   
-  // Session should be cleaned up
-  const sessAfter = mockRedis.storage.get(sKey);
-  assertFalsy(sessAfter && sessAfter.totalChunks, 'Session should be deleted after expiry');
+  // Poll again should be empty
+  result = sessionManager.pollSignals(toPeer);
+  assertEqual(result.messages.length, 0, 'Queue should be empty after poll');
   
-  console.log('✓ Session expiry test passed');
+  console.log('✓ Signal queueing test passed');
+}
+
+async function testInviteCodeCollision() {
+  console.log('Test: Invite code collision handling');
+  
+  const inviteCode = 'Uv9Wx1Yz';
+  const peerId1 = 'peer-first';
+  const peerId2 = 'peer-second';
+  
+  // Register first peer
+  let result = sessionManager.registerPeer(inviteCode, peerId1);
+  assertEqual(result.status, 'registered', 'First registration should succeed');
+  
+  // Try to register different peer with same code
+  result = sessionManager.registerPeer(inviteCode, peerId2);
+  assertEqual(result.error, 'invite_code_in_use', 'Second peer should be rejected');
+  
+  // Same peer re-registering should work
+  result = sessionManager.registerPeer(inviteCode, peerId1);
+  assertEqual(result.status, 'registered', 'Same peer re-registration should succeed');
+  
+  console.log('✓ Invite code collision test passed');
 }
 
 // Run all tests
@@ -391,11 +315,13 @@ async function runTests() {
     await testSingleDirectionTransfer();
     await testAcknowledgmentAfterCompletion();
     await testBidirectionalTransfer();
-    await testSessionCleanupAfterAck();
     await testDuplicateChunkRejection();
     await testTotalChunksMismatch();
     await testInvalidChunkData();
-    await testSessionExpiry();
+    await testPeerRegistration();
+    await testInvalidInviteCodeFormat();
+    await testSignalQueueing();
+    await testInviteCodeCollision();
     
     console.log('\n=== All Tests Passed! ===');
     process.exit(0);

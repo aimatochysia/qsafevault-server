@@ -1,2 +1,4 @@
 .vscode
 node_modules/
+copier.sh
+copier.bat

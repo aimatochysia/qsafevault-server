@@ -1,31 +1,66 @@
+/**
+ * Ephemeral in-memory session manager for serverless signaling.
+ * No Redis/database dependency - all data is stored in memory with TTL.
+ * Supports both chunk-based relay and WebRTC signaling.
+ * 
+ * Invite codes are 8-character case-sensitive alphanumeric strings.
+ */
 
+// TTL for sessions (30s for signaling, 60s for chunk relay)
+const SIGNAL_TTL_MS = 30000;
+const CHUNK_TTL_MS = 60000;
 
-const { getRedisClient } = require('./redisClient');
+// In-memory stores (ephemeral, cleared on function cold start)
+const sessions = new Map();        // inviteCode -> SessionData
+const signalQueues = new Map();    // peerId -> [SignalMessage]
+const ackStore = new Map();        // inviteCode:passwordHash -> { acknowledged, expires }
 
-// TTL increased to 60s to support bidirectional relay scenarios
-// where user interaction may be required between transfers
-const TTL_MS = 60000;
-const TTL_SEC = Math.ceil(TTL_MS / 1000);
+function now() { return Date.now(); }
 
-function sessionKey(pin, passwordHash) {
-  return `qsv:session:${pin}:${passwordHash}`;
+// Purge expired entries from all stores
+function purgeExpired() {
+  const cutoff = now();
+  
+  // Purge expired sessions
+  for (const [key, sess] of sessions.entries()) {
+    if (sess.expires < cutoff) {
+      sessions.delete(key);
+    }
+  }
+  
+  // Purge expired signal queues
+  for (const [peerId, queue] of signalQueues.entries()) {
+    const filtered = queue.filter(msg => msg.expires > cutoff);
+    if (filtered.length === 0) {
+      signalQueues.delete(peerId);
+    } else {
+      signalQueues.set(peerId, filtered);
+    }
+  }
+  
+  // Purge expired ack entries
+  for (const [key, ack] of ackStore.entries()) {
+    if (ack.expires < cutoff) {
+      ackStore.delete(key);
+    }
+  }
 }
 
-function chunkKey(pin, passwordHash, chunkIndex) {
-  return `qsv:chunk:${pin}:${passwordHash}:${chunkIndex}`;
+// Use a separator that cannot appear in base64-encoded passwordHash or alphanumeric invite codes
+function sessionKey(inviteCode, passwordHash) {
+  // Both inviteCode (alphanumeric) and passwordHash (base64) are URL-safe
+  // Using a null character as separator to avoid any possible collision
+  return `sess\x00${inviteCode}\x00${passwordHash}`;
 }
 
-// Separate key for acknowledgment to persist after session deletion
-function ackKey(pin, passwordHash) {
-  return `qsv:ack:${pin}:${passwordHash}`;
-}
-
-async function purgeExpired() {
-}
+// ==================== Chunk-based Relay (legacy compatibility) ====================
 
 async function pushChunk({ pin, passwordHash, chunkIndex, totalChunks, data }) {
+  // 'pin' is now an 8-character invite code
+  const inviteCode = pin;
+  
   if (
-    typeof pin !== 'string' ||
+    typeof inviteCode !== 'string' ||
     typeof passwordHash !== 'string' ||
     typeof chunkIndex !== 'number' ||
     typeof totalChunks !== 'number' ||
@@ -38,134 +73,253 @@ async function pushChunk({ pin, passwordHash, chunkIndex, totalChunks, data }) {
   ) {
     return { error: 'invalid_chunk', status: 'waiting' };
   }
-  const redis = getRedisClient();
-  const sKey = sessionKey(pin, passwordHash);
-  const cKey = chunkKey(pin, passwordHash, chunkIndex);
-  let sess = await redis.hGetAll(sKey);
-  if (!sess || !sess.totalChunks) {
-    await redis.hSet(sKey, {
-      created: Date.now(),
-      lastTouched: Date.now(),
+  
+  purgeExpired();
+  
+  const key = sessionKey(inviteCode, passwordHash);
+  let sess = sessions.get(key);
+  
+  if (!sess) {
+    sess = {
+      created: now(),
+      lastTouched: now(),
+      expires: now() + CHUNK_TTL_MS,
       totalChunks,
-      delivered: JSON.stringify([]),
-    });
-    await redis.expire(sKey, TTL_SEC);
+      chunks: new Map(),
+      delivered: new Set(),
+      completed: false,
+    };
+    sessions.set(key, sess);
   } else {
-    if (parseInt(sess.totalChunks) !== totalChunks) {
+    if (sess.totalChunks !== totalChunks) {
       return { error: 'totalChunks_mismatch', status: 'waiting' };
     }
-    const delivered = JSON.parse(sess.delivered || '[]');
-    if (delivered.includes(chunkIndex)) {
-      return { error: 'duplicate_chunk', status: 'waiting' };
-    }
-    if (await redis.exists(cKey)) {
+    if (sess.delivered.has(chunkIndex) || sess.chunks.has(chunkIndex)) {
       return { error: 'duplicate_chunk', status: 'waiting' };
     }
   }
-  await redis.set(cKey, data, { EX: TTL_SEC });
-  await redis.hSet(sKey, { lastTouched: Date.now() });
-  await redis.expire(sKey, TTL_SEC);
+  
+  sess.chunks.set(chunkIndex, data);
+  sess.lastTouched = now();
+  sess.expires = now() + CHUNK_TTL_MS;
+  
   return { status: 'waiting' };
 }
 
 async function nextChunk({ pin, passwordHash }) {
-  const redis = getRedisClient();
-  const sKey = sessionKey(pin, passwordHash);
-  const sess = await redis.hGetAll(sKey);
-  if (!sess || !sess.totalChunks) {
-    return { status: 'expired' };
-  }
-  const lastTouched = parseInt(sess.lastTouched || '0');
-  if (Date.now() - lastTouched > TTL_MS) {
-    await redis.del(sKey);
-    for (let i = 0; i < parseInt(sess.totalChunks); ++i) {
-      await redis.del(chunkKey(pin, passwordHash, i));
-    }
+  const inviteCode = pin;
+  purgeExpired();
+  
+  const key = sessionKey(inviteCode, passwordHash);
+  const sess = sessions.get(key);
+  
+  if (!sess) {
     return { status: 'expired' };
   }
   
-  // If already completed, check if acknowledged
-  if (sess.completed === '1') {
-    const aKey = ackKey(pin, passwordHash);
-    const isAcknowledged = await redis.get(aKey);
-    if (isAcknowledged === '1') {
-      // Clean up session after acknowledgment
-      await redis.del(sKey);
-      for (let i = 0; i < parseInt(sess.totalChunks); ++i) {
-        await redis.del(chunkKey(pin, passwordHash, i));
-      }
-      await redis.del(aKey);
+  if (now() - sess.lastTouched > CHUNK_TTL_MS) {
+    sessions.delete(key);
+    return { status: 'expired' };
+  }
+  
+  // If already completed
+  if (sess.completed) {
+    const ackKey = sessionKey(inviteCode, passwordHash);
+    const ack = ackStore.get(ackKey);
+    if (ack && ack.acknowledged) {
+      sessions.delete(key);
+      ackStore.delete(ackKey);
     }
     return { status: 'done' };
   }
   
-  let found = null;
-  for (let i = 0; i < parseInt(sess.totalChunks); ++i) {
-    const cKey = chunkKey(pin, passwordHash, i);
-    const data = await redis.get(cKey);
-    if (data) {
-      found = { chunkIndex: i, data };
-      await redis.del(cKey);
-      let delivered = JSON.parse(sess.delivered || '[]');
-      delivered.push(i);
-      await redis.hSet(sKey, { delivered: JSON.stringify(delivered), lastTouched: Date.now() });
-      await redis.expire(sKey, TTL_SEC);
+  // Find next available chunk
+  for (let i = 0; i < sess.totalChunks; i++) {
+    if (sess.chunks.has(i) && !sess.delivered.has(i)) {
+      const data = sess.chunks.get(i);
+      sess.chunks.delete(i);
+      sess.delivered.add(i);
+      sess.lastTouched = now();
+      sess.expires = now() + CHUNK_TTL_MS;
+      
       return {
         status: 'chunkAvailable',
         chunk: {
           chunkIndex: i,
-          totalChunks: parseInt(sess.totalChunks),
+          totalChunks: sess.totalChunks,
           data,
         },
       };
     }
   }
   
-  // Check if all chunks have been delivered
-  let delivered = JSON.parse(sess.delivered || '[]');
-  if (delivered.length === parseInt(sess.totalChunks)) {
-    // Mark session as completed but keep it alive for acknowledgment
-    // Session will be cleaned up when acknowledged or TTL expires
-    await redis.hSet(sKey, { completed: '1', lastTouched: Date.now() });
-    await redis.expire(sKey, TTL_SEC);
-    // Clean up remaining chunk keys (should already be deleted)
-    for (let i = 0; i < parseInt(sess.totalChunks); ++i) {
-      await redis.del(chunkKey(pin, passwordHash, i));
-    }
+  // Check if all chunks delivered
+  if (sess.delivered.size === sess.totalChunks) {
+    sess.completed = true;
+    sess.chunks.clear();
     return { status: 'done' };
   }
+  
   return { status: 'waiting' };
 }
 
-// Set acknowledgment using a separate key that persists beyond session deletion
-// This allows bidirectional transfers to confirm receipt even after completion
 async function setAcknowledged(pin, passwordHash) {
-  const redis = getRedisClient();
-  const aKey = ackKey(pin, passwordHash);
-  await redis.set(aKey, '1', { EX: TTL_SEC });
+  const inviteCode = pin;
+  purgeExpired();
   
-  // Also update session if it still exists
-  const sKey = sessionKey(pin, passwordHash);
-  const sess = await redis.hGetAll(sKey);
-  if (sess && sess.totalChunks) {
-    await redis.hSet(sKey, { acknowledged: '1', lastTouched: Date.now() });
-    await redis.expire(sKey, TTL_SEC);
+  const key = sessionKey(inviteCode, passwordHash);
+  ackStore.set(key, {
+    acknowledged: true,
+    expires: now() + CHUNK_TTL_MS,
+  });
+  
+  // Update session if exists
+  const sess = sessions.get(key);
+  if (sess) {
+    sess.acknowledged = true;
+    sess.lastTouched = now();
+    sess.expires = now() + CHUNK_TTL_MS;
   }
 }
 
-// Check acknowledgment from separate ack key (persists after session deletion)
 async function getAcknowledged(pin, passwordHash) {
-  const redis = getRedisClient();
-  const aKey = ackKey(pin, passwordHash);
-  const ackValue = await redis.get(aKey);
-  if (ackValue === '1') {
+  const inviteCode = pin;
+  purgeExpired();
+  
+  const key = sessionKey(inviteCode, passwordHash);
+  const ack = ackStore.get(key);
+  if (ack && ack.acknowledged) {
     return true;
   }
   
-  // Fallback: check session hash if ack key not found
-  const sKey = sessionKey(pin, passwordHash);
-  const sess = await redis.hGetAll(sKey);
-  return sess && sess.acknowledged === '1';
+  const sess = sessions.get(key);
+  return sess && sess.acknowledged === true;
 }
 
-module.exports = { pushChunk, nextChunk, purgeExpired, TTL_MS, setAcknowledged, getAcknowledged };
+// ==================== WebRTC Signaling ====================
+
+/**
+ * Queue a signaling message for a peer.
+ * Messages are ephemeral and expire after SIGNAL_TTL_MS.
+ */
+function queueSignal({ from, to, type, payload }) {
+  purgeExpired();
+  
+  if (!from || !to || !type || !payload) {
+    return { error: 'missing_fields' };
+  }
+  
+  let queue = signalQueues.get(to);
+  if (!queue) {
+    queue = [];
+    signalQueues.set(to, queue);
+  }
+  
+  queue.push({
+    from,
+    type,
+    payload,
+    timestamp: now(),
+    expires: now() + SIGNAL_TTL_MS,
+  });
+  
+  return { status: 'queued' };
+}
+
+/**
+ * Poll for signaling messages addressed to a peer.
+ * Returns and removes messages from the queue.
+ */
+function pollSignals(peerId) {
+  purgeExpired();
+  
+  const queue = signalQueues.get(peerId);
+  if (!queue || queue.length === 0) {
+    return { messages: [] };
+  }
+  
+  const messages = queue.splice(0, queue.length);
+  signalQueues.delete(peerId);
+  
+  return {
+    messages: messages.map(m => ({
+      from: m.from,
+      type: m.type,
+      payload: m.payload,
+      timestamp: m.timestamp,
+    })),
+  };
+}
+
+/**
+ * Register a peer with an invite code for discovery.
+ * Creates a session that maps inviteCode -> peerId.
+ */
+function registerPeer(inviteCode, peerId) {
+  purgeExpired();
+  
+  if (!inviteCode || !peerId) {
+    return { error: 'missing_fields' };
+  }
+  
+  // Validate invite code format: 8 chars, alphanumeric case-sensitive
+  if (!/^[A-Za-z0-9]{8}$/.test(inviteCode)) {
+    return { error: 'invalid_invite_code' };
+  }
+  
+  const existing = sessions.get(`peer:${inviteCode}`);
+  if (existing && existing.expires > now()) {
+    // Check if this is the same peer re-registering
+    if (existing.peerId !== peerId) {
+      return { error: 'invite_code_in_use' };
+    }
+  }
+  
+  sessions.set(`peer:${inviteCode}`, {
+    peerId,
+    created: now(),
+    expires: now() + SIGNAL_TTL_MS,
+  });
+  
+  return { status: 'registered', ttlSec: Math.floor(SIGNAL_TTL_MS / 1000) };
+}
+
+/**
+ * Look up a peer by invite code.
+ */
+function lookupPeer(inviteCode) {
+  purgeExpired();
+  
+  if (!inviteCode) {
+    return { error: 'missing_invite_code' };
+  }
+  
+  const sess = sessions.get(`peer:${inviteCode}`);
+  if (!sess || sess.expires < now()) {
+    return { error: 'peer_not_found' };
+  }
+  
+  return { peerId: sess.peerId };
+}
+
+const TTL_MS = CHUNK_TTL_MS;
+
+module.exports = {
+  // Chunk relay (legacy)
+  pushChunk,
+  nextChunk,
+  setAcknowledged,
+  getAcknowledged,
+  purgeExpired,
+  TTL_MS,
+  
+  // WebRTC signaling
+  queueSignal,
+  pollSignals,
+  registerPeer,
+  lookupPeer,
+  
+  // Constants
+  SIGNAL_TTL_MS,
+  CHUNK_TTL_MS,
+};
