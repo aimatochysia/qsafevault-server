@@ -6,9 +6,25 @@
  * Invite codes are 8-character case-sensitive alphanumeric strings.
  */
 
-// TTL for sessions (30s for signaling, 60s for chunk relay)
+// TTL for sessions (30s for signaling, base 60s for chunk relay)
 const SIGNAL_TTL_MS = 30000;
-const CHUNK_TTL_MS = 60000;
+const CHUNK_TTL_BASE_MS = 60000;
+const CHUNK_TTL_PER_CHUNK_MS = 500; // Add 500ms per chunk for large transfers
+
+/**
+ * Calculate dynamic TTL based on total chunks.
+ * Larger transfers get more time to complete.
+ * @param {number|null} totalChunks - Number of chunks, or null for base TTL
+ * @returns {number} TTL in milliseconds
+ */
+function getChunkTTL(totalChunks) {
+  if (!totalChunks || totalChunks <= 0) {
+    return CHUNK_TTL_BASE_MS;
+  }
+  // Base 60s + 500ms per chunk, max 180s
+  const dynamic = CHUNK_TTL_BASE_MS + (totalChunks * CHUNK_TTL_PER_CHUNK_MS);
+  return Math.min(dynamic, 180000); // Cap at 3 minutes
+}
 
 // In-memory stores (ephemeral, cleared on function cold start)
 const sessions = new Map();        // inviteCode -> SessionData
@@ -78,20 +94,27 @@ async function pushChunk({ pin, passwordHash, chunkIndex, totalChunks, data }) {
   
   const key = sessionKey(inviteCode, passwordHash);
   let sess = sessions.get(key);
+  const ttl = getChunkTTL(totalChunks);
   
   if (!sess) {
     sess = {
       created: now(),
       lastTouched: now(),
-      expires: now() + CHUNK_TTL_MS,
+      expires: now() + ttl,
       totalChunks,
       chunks: new Map(),
       delivered: new Set(),
       completed: false,
+      ttl, // Store TTL for future refreshes
     };
     sessions.set(key, sess);
   } else {
-    if (sess.totalChunks !== totalChunks) {
+    // If session was created by receiver waiting for sender, set totalChunks now
+    if (sess.waitingForSender && sess.totalChunks === null) {
+      sess.totalChunks = totalChunks;
+      sess.waitingForSender = false;
+      sess.ttl = ttl;
+    } else if (sess.totalChunks !== totalChunks) {
       return { error: 'totalChunks_mismatch', status: 'waiting' };
     }
     if (sess.delivered.has(chunkIndex) || sess.chunks.has(chunkIndex)) {
@@ -101,7 +124,7 @@ async function pushChunk({ pin, passwordHash, chunkIndex, totalChunks, data }) {
   
   sess.chunks.set(chunkIndex, data);
   sess.lastTouched = now();
-  sess.expires = now() + CHUNK_TTL_MS;
+  sess.expires = now() + (sess.ttl || ttl);
   
   return { status: 'waiting' };
 }
@@ -111,15 +134,41 @@ async function nextChunk({ pin, passwordHash }) {
   purgeExpired();
   
   const key = sessionKey(inviteCode, passwordHash);
-  const sess = sessions.get(key);
+  let sess = sessions.get(key);
   
   if (!sess) {
+    // Create a placeholder session so the receiver can start waiting
+    // before the sender pushes chunks. This supports bidirectional sync
+    // where the original sender becomes receiver and starts polling
+    // before the original receiver starts pushing return data.
+    const ttl = getChunkTTL(null); // Use base TTL for placeholder
+    sess = {
+      created: now(),
+      lastTouched: now(),
+      expires: now() + ttl,
+      totalChunks: null, // Will be set when first chunk arrives
+      chunks: new Map(),
+      delivered: new Set(),
+      completed: false,
+      waitingForSender: true, // Mark as waiting for sender to push chunks
+      ttl,
+    };
+    sessions.set(key, sess);
+    return { status: 'waiting' };
+  }
+  
+  const sessionTTL = sess.ttl || getChunkTTL(sess.totalChunks);
+  
+  if (now() - sess.lastTouched > sessionTTL) {
+    sessions.delete(key);
     return { status: 'expired' };
   }
   
-  if (now() - sess.lastTouched > CHUNK_TTL_MS) {
-    sessions.delete(key);
-    return { status: 'expired' };
+  // If still waiting for sender to push first chunk
+  if (sess.waitingForSender && sess.totalChunks === null) {
+    sess.lastTouched = now();
+    sess.expires = now() + sessionTTL;
+    return { status: 'waiting' };
   }
   
   // If already completed
@@ -140,7 +189,7 @@ async function nextChunk({ pin, passwordHash }) {
       sess.chunks.delete(i);
       sess.delivered.add(i);
       sess.lastTouched = now();
-      sess.expires = now() + CHUNK_TTL_MS;
+      sess.expires = now() + sessionTTL;
       
       return {
         status: 'chunkAvailable',
@@ -160,6 +209,10 @@ async function nextChunk({ pin, passwordHash }) {
     return { status: 'done' };
   }
   
+  // Keep session alive while actively polling
+  sess.lastTouched = now();
+  sess.expires = now() + sessionTTL;
+  
   return { status: 'waiting' };
 }
 
@@ -168,9 +221,10 @@ async function setAcknowledged(pin, passwordHash) {
   purgeExpired();
   
   const key = sessionKey(inviteCode, passwordHash);
+  const ttl = getChunkTTL(null); // Use base TTL for acks
   ackStore.set(key, {
     acknowledged: true,
-    expires: now() + CHUNK_TTL_MS,
+    expires: now() + ttl,
   });
   
   // Update session if exists
@@ -178,7 +232,7 @@ async function setAcknowledged(pin, passwordHash) {
   if (sess) {
     sess.acknowledged = true;
     sess.lastTouched = now();
-    sess.expires = now() + CHUNK_TTL_MS;
+    sess.expires = now() + (sess.ttl || ttl);
   }
 }
 
@@ -194,6 +248,44 @@ async function getAcknowledged(pin, passwordHash) {
   
   const sess = sessions.get(key);
   return sess && sess.acknowledged === true;
+}
+
+/**
+ * Mark a session as complete and schedule it for cleanup.
+ * This is called by clients when they've successfully completed
+ * a bidirectional sync and want to clean up resources.
+ */
+async function markComplete(pin, passwordHash) {
+  const inviteCode = pin;
+  purgeExpired();
+  
+  const key = sessionKey(inviteCode, passwordHash);
+  const sess = sessions.get(key);
+  
+  if (sess) {
+    sess.completed = true;
+    sess.chunks.clear();
+    // Set short expiry (10s) for completed sessions
+    sess.expires = now() + 10000;
+    return { status: 'marked_complete' };
+  }
+  
+  return { status: 'not_found' };
+}
+
+/**
+ * Delete a session immediately.
+ * This is called by clients when they want to forcefully clean up.
+ */
+async function deleteSession(pin, passwordHash) {
+  const inviteCode = pin;
+  purgeExpired();
+  
+  const key = sessionKey(inviteCode, passwordHash);
+  const deleted = sessions.delete(key);
+  ackStore.delete(key);
+  
+  return { status: deleted ? 'deleted' : 'not_found' };
 }
 
 // ==================== WebRTC Signaling ====================
@@ -302,7 +394,7 @@ function lookupPeer(inviteCode) {
   return { peerId: sess.peerId };
 }
 
-const TTL_MS = CHUNK_TTL_MS;
+const TTL_MS = CHUNK_TTL_BASE_MS; // Backward compatibility
 
 module.exports = {
   // Chunk relay (legacy)
@@ -319,7 +411,12 @@ module.exports = {
   registerPeer,
   lookupPeer,
   
+  // Completion and cleanup
+  markComplete,
+  deleteSession,
+  
   // Constants
   SIGNAL_TTL_MS,
-  CHUNK_TTL_MS,
+  CHUNK_TTL_BASE_MS,
+  getChunkTTL,
 };

@@ -6,6 +6,8 @@
  * - receive: Poll for next chunk
  * - ack: Acknowledge receipt
  * - ack-status: Check acknowledgment status
+ * - complete: Mark session as complete (sets 10s expiry)
+ * - delete: Delete session immediately
  * 
  * WebRTC signaling actions (new):
  * - register: Register peer with invite code
@@ -13,7 +15,8 @@
  * - signal: Send signaling message (offer/answer/ICE)
  * - poll: Poll for signaling messages
  * 
- * All data is ephemeral - stored in memory only with short TTL.
+ * All data is ephemeral - stored in memory only with dynamic TTL.
+ * TTL is based on chunk count: 60s base + 500ms per chunk (max 180s).
  * Server cannot read encrypted payloads (zero-trust).
  */
 
@@ -162,6 +165,41 @@ module.exports = async function relayHandler(req, res) {
     }
     try {
       const result = sessionManager.pollSignals(peerId);
+      return res.status(200).json(result);
+    } catch (e) {
+      return res.status(500).json({ error: 'server_error', details: e+'' });
+    }
+  }
+
+  // ==================== Session Cleanup ====================
+  
+  /**
+   * Mark a session as complete (for graceful cleanup).
+   * Sets a short expiry on the session.
+   */
+  if (action === 'complete') {
+    const { pin, passwordHash } = req.body;
+    if (!pin || !passwordHash) {
+      return res.status(400).json({ error: 'missing_fields' });
+    }
+    try {
+      const result = await sessionManager.markComplete(pin, passwordHash);
+      return res.status(200).json(result);
+    } catch (e) {
+      return res.status(500).json({ error: 'server_error', details: e+'' });
+    }
+  }
+  
+  /**
+   * Delete a session immediately (forceful cleanup).
+   */
+  if (action === 'delete') {
+    const { pin, passwordHash } = req.body;
+    if (!pin || !passwordHash) {
+      return res.status(400).json({ error: 'missing_fields' });
+    }
+    try {
+      const result = await sessionManager.deleteSession(pin, passwordHash);
       return res.status(200).json(result);
     } catch (e) {
       return res.status(500).json({ error: 'server_error', details: e+'' });
