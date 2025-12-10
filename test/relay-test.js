@@ -103,41 +103,37 @@ async function testAcknowledgmentAfterCompletion() {
 }
 
 async function testBidirectionalTransfer() {
-  console.log('Test: Bidirectional transfer with same invite code');
+  console.log('Test: Bidirectional transfer with same invite code and password');
   
   const pin = 'Kj8Lm4Qn';
-  const passwordHash1 = 'hashA';
-  const passwordHash2 = 'hashB';
+  const passwordHash = 'hashBidirectional';
   
   // Direction A->B: push and receive
   await sessionManager.pushChunk({
-    pin, passwordHash: passwordHash1, chunkIndex: 0, totalChunks: 1, data: 'dataA'
+    pin, passwordHash, chunkIndex: 0, totalChunks: 1, data: 'dataAtoB', direction: 'AtoB'
   });
-  let result = await sessionManager.nextChunk({ pin, passwordHash: passwordHash1 });
-  assertEqual(result.status, 'chunkAvailable', 'Should receive chunk A');
+  let result = await sessionManager.nextChunk({ pin, passwordHash, direction: 'AtoB' });
+  assertEqual(result.status, 'chunkAvailable', 'Should receive chunk A->B');
+  assertEqual(result.chunk.data, 'dataAtoB', 'A->B data should match');
   
-  result = await sessionManager.nextChunk({ pin, passwordHash: passwordHash1 });
-  assertEqual(result.status, 'done', 'Direction A should be done');
+  result = await sessionManager.nextChunk({ pin, passwordHash, direction: 'AtoB' });
+  assertEqual(result.status, 'done', 'Direction A->B should be done');
   
-  // Acknowledge direction A
-  await sessionManager.setAcknowledged(pin, passwordHash1);
-  let acked = await sessionManager.getAcknowledged(pin, passwordHash1);
-  assertTruthy(acked, 'Direction A should be acknowledged');
-  
-  // Direction B->A: push and receive (using different passwordHash)
+  // Direction B->A: push and receive (same session, different direction)
   await sessionManager.pushChunk({
-    pin, passwordHash: passwordHash2, chunkIndex: 0, totalChunks: 1, data: 'dataB'
+    pin, passwordHash, chunkIndex: 0, totalChunks: 1, data: 'dataBtoA', direction: 'BtoA'
   });
-  result = await sessionManager.nextChunk({ pin, passwordHash: passwordHash2 });
-  assertEqual(result.status, 'chunkAvailable', 'Should receive chunk B');
+  result = await sessionManager.nextChunk({ pin, passwordHash, direction: 'BtoA' });
+  assertEqual(result.status, 'chunkAvailable', 'Should receive chunk B->A');
+  assertEqual(result.chunk.data, 'dataBtoA', 'B->A data should match');
   
-  result = await sessionManager.nextChunk({ pin, passwordHash: passwordHash2 });
-  assertEqual(result.status, 'done', 'Direction B should be done');
+  result = await sessionManager.nextChunk({ pin, passwordHash, direction: 'BtoA' });
+  assertEqual(result.status, 'done', 'Direction B->A should be done');
   
-  // Acknowledge direction B
-  await sessionManager.setAcknowledged(pin, passwordHash2);
-  acked = await sessionManager.getAcknowledged(pin, passwordHash2);
-  assertTruthy(acked, 'Direction B should be acknowledged');
+  // Acknowledge the session
+  await sessionManager.setAcknowledged(pin, passwordHash);
+  let acked = await sessionManager.getAcknowledged(pin, passwordHash);
+  assertTruthy(acked, 'Session should be acknowledged');
   
   console.log('✓ Bidirectional transfer test passed');
 }

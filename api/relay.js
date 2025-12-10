@@ -29,10 +29,12 @@ module.exports = async function relayHandler(req, res) {
   // ==================== Chunk-based Relay (legacy) ====================
   
   if (action === 'send') {
-    const { pin, passwordHash, chunkIndex, totalChunks, data } = req.body;
+    const { pin, passwordHash, chunkIndex, totalChunks, data, direction } = req.body;
     if (!pin || !passwordHash || typeof chunkIndex !== 'number' || typeof totalChunks !== 'number' || !data) {
       return res.status(400).json({ error: 'missing_fields', status: 'waiting' });
     }
+    // direction: 'AtoB' or 'BtoA' for bidirectional support on single session
+    const dir = direction || 'AtoB';
     try {
       const result = await sessionManager.pushChunk({
         pin,
@@ -40,6 +42,7 @@ module.exports = async function relayHandler(req, res) {
         chunkIndex,
         totalChunks,
         data,
+        direction: dir,
       });
       return res.status(200).json(result);
     } catch (e) {
@@ -48,12 +51,14 @@ module.exports = async function relayHandler(req, res) {
   }
   
   if (action === 'receive') {
-    const { pin, passwordHash } = req.body;
+    const { pin, passwordHash, direction } = req.body;
     if (!pin || !passwordHash) {
       return res.status(400).json({ status: 'waiting', error: 'missing_pin_or_passwordHash' });
     }
+    // direction: 'AtoB' or 'BtoA' - receiver specifies which direction they want
+    const dir = direction || 'AtoB';
     try {
-      const result = await sessionManager.nextChunk({ pin, passwordHash });
+      const result = await sessionManager.nextChunk({ pin, passwordHash, direction: dir });
       if (result.status === 'chunkAvailable') {
         return res.status(200).json({
           status: 'chunkAvailable',

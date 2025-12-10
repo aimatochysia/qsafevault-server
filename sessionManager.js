@@ -71,9 +71,11 @@ function sessionKey(inviteCode, passwordHash) {
 
 // ==================== Chunk-based Relay (legacy compatibility) ====================
 
-async function pushChunk({ pin, passwordHash, chunkIndex, totalChunks, data }) {
+async function pushChunk({ pin, passwordHash, chunkIndex, totalChunks, data, direction }) {
   // 'pin' is now an 8-character invite code
+  // direction: 'AtoB' or 'BtoA' for bidirectional support
   const inviteCode = pin;
+  const dir = direction || 'AtoB';
   
   if (
     typeof inviteCode !== 'string' ||
@@ -101,36 +103,52 @@ async function pushChunk({ pin, passwordHash, chunkIndex, totalChunks, data }) {
       created: now(),
       lastTouched: now(),
       expires: now() + ttl,
-      totalChunks,
-      chunks: new Map(),
-      delivered: new Set(),
-      completed: false,
+      // Store chunks per direction for bidirectional support
+      AtoB: {
+        totalChunks: dir === 'AtoB' ? totalChunks : null,
+        chunks: new Map(),
+        delivered: new Set(),
+        completed: false,
+      },
+      BtoA: {
+        totalChunks: dir === 'BtoA' ? totalChunks : null,
+        chunks: new Map(),
+        delivered: new Set(),
+        completed: false,
+      },
       ttl, // Store TTL for future refreshes
+      waitingForSender: false,
     };
     sessions.set(key, sess);
-  } else {
-    // If session was created by receiver waiting for sender, set totalChunks now
-    if (sess.waitingForSender && sess.totalChunks === null) {
-      sess.totalChunks = totalChunks;
-      sess.waitingForSender = false;
-      sess.ttl = ttl;
-    } else if (sess.totalChunks !== totalChunks) {
-      return { error: 'totalChunks_mismatch', status: 'waiting' };
-    }
-    if (sess.delivered.has(chunkIndex) || sess.chunks.has(chunkIndex)) {
-      return { error: 'duplicate_chunk', status: 'waiting' };
-    }
   }
   
-  sess.chunks.set(chunkIndex, data);
+  const dirData = sess[dir];
+  if (!dirData) {
+    return { error: 'invalid_direction', status: 'waiting' };
+  }
+  
+  // Set totalChunks for this direction if not set
+  if (dirData.totalChunks === null) {
+    dirData.totalChunks = totalChunks;
+    sess.ttl = Math.max(sess.ttl || ttl, ttl); // Use larger TTL
+  } else if (dirData.totalChunks !== totalChunks) {
+    return { error: 'totalChunks_mismatch', status: 'waiting' };
+  }
+  
+  if (dirData.delivered.has(chunkIndex) || dirData.chunks.has(chunkIndex)) {
+    return { error: 'duplicate_chunk', status: 'waiting' };
+  }
+  
+  dirData.chunks.set(chunkIndex, data);
   sess.lastTouched = now();
   sess.expires = now() + (sess.ttl || ttl);
   
   return { status: 'waiting' };
 }
 
-async function nextChunk({ pin, passwordHash }) {
+async function nextChunk({ pin, passwordHash, direction }) {
   const inviteCode = pin;
+  const dir = direction || 'AtoB';
   purgeExpired();
   
   const key = sessionKey(inviteCode, passwordHash);
@@ -138,26 +156,36 @@ async function nextChunk({ pin, passwordHash }) {
   
   if (!sess) {
     // Create a placeholder session so the receiver can start waiting
-    // before the sender pushes chunks. This supports bidirectional sync
-    // where the original sender becomes receiver and starts polling
-    // before the original receiver starts pushing return data.
     const ttl = getChunkTTL(null); // Use base TTL for placeholder
     sess = {
       created: now(),
       lastTouched: now(),
       expires: now() + ttl,
-      totalChunks: null, // Will be set when first chunk arrives
-      chunks: new Map(),
-      delivered: new Set(),
-      completed: false,
-      waitingForSender: true, // Mark as waiting for sender to push chunks
+      AtoB: {
+        totalChunks: null,
+        chunks: new Map(),
+        delivered: new Set(),
+        completed: false,
+      },
+      BtoA: {
+        totalChunks: null,
+        chunks: new Map(),
+        delivered: new Set(),
+        completed: false,
+      },
+      waitingForSender: true,
       ttl,
     };
     sessions.set(key, sess);
     return { status: 'waiting' };
   }
   
-  const sessionTTL = sess.ttl || getChunkTTL(sess.totalChunks);
+  const dirData = sess[dir];
+  if (!dirData) {
+    return { error: 'invalid_direction', status: 'waiting' };
+  }
+  
+  const sessionTTL = sess.ttl || getChunkTTL(dirData.totalChunks);
   
   if (now() - sess.lastTouched > sessionTTL) {
     sessions.delete(key);
@@ -165,48 +193,53 @@ async function nextChunk({ pin, passwordHash }) {
   }
   
   // If still waiting for sender to push first chunk
-  if (sess.waitingForSender && sess.totalChunks === null) {
+  if (sess.waitingForSender && dirData.totalChunks === null) {
     sess.lastTouched = now();
     sess.expires = now() + sessionTTL;
     return { status: 'waiting' };
   }
   
-  // If already completed
-  if (sess.completed) {
-    const ackKey = sessionKey(inviteCode, passwordHash);
-    const ack = ackStore.get(ackKey);
-    if (ack && ack.acknowledged) {
-      sessions.delete(key);
-      ackStore.delete(ackKey);
+  // If already completed for this direction
+  if (dirData.completed) {
+    // Check if both directions are complete
+    if (sess.AtoB.completed && sess.BtoA.completed) {
+      const ackKey = sessionKey(inviteCode, passwordHash);
+      const ack = ackStore.get(ackKey);
+      if (ack && ack.acknowledged) {
+        sessions.delete(key);
+        ackStore.delete(ackKey);
+      }
     }
     return { status: 'done' };
   }
   
-  // Find next available chunk
-  for (let i = 0; i < sess.totalChunks; i++) {
-    if (sess.chunks.has(i) && !sess.delivered.has(i)) {
-      const data = sess.chunks.get(i);
-      sess.chunks.delete(i);
-      sess.delivered.add(i);
-      sess.lastTouched = now();
-      sess.expires = now() + sessionTTL;
-      
-      return {
-        status: 'chunkAvailable',
-        chunk: {
-          chunkIndex: i,
-          totalChunks: sess.totalChunks,
-          data,
-        },
-      };
+  // Find next available chunk for this direction
+  if (dirData.totalChunks) {
+    for (let i = 0; i < dirData.totalChunks; i++) {
+      if (dirData.chunks.has(i) && !dirData.delivered.has(i)) {
+        const data = dirData.chunks.get(i);
+        dirData.chunks.delete(i);
+        dirData.delivered.add(i);
+        sess.lastTouched = now();
+        sess.expires = now() + sessionTTL;
+        
+        return {
+          status: 'chunkAvailable',
+          chunk: {
+            chunkIndex: i,
+            totalChunks: dirData.totalChunks,
+            data,
+          },
+        };
+      }
     }
-  }
-  
-  // Check if all chunks delivered
-  if (sess.delivered.size === sess.totalChunks) {
-    sess.completed = true;
-    sess.chunks.clear();
-    return { status: 'done' };
+    
+    // Check if all chunks delivered for this direction
+    if (dirData.delivered.size === dirData.totalChunks) {
+      dirData.completed = true;
+      dirData.chunks.clear();
+      return { status: 'done' };
+    }
   }
   
   // Keep session alive while actively polling
@@ -263,8 +296,15 @@ async function markComplete(pin, passwordHash) {
   const sess = sessions.get(key);
   
   if (sess) {
-    sess.completed = true;
-    sess.chunks.clear();
+    // Mark both directions as completed and clear chunks
+    if (sess.AtoB) {
+      sess.AtoB.completed = true;
+      sess.AtoB.chunks.clear();
+    }
+    if (sess.BtoA) {
+      sess.BtoA.completed = true;
+      sess.BtoA.chunks.clear();
+    }
     // Set short expiry (10s) for completed sessions
     sess.expires = now() + 10000;
     return { status: 'marked_complete' };
