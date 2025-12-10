@@ -1,22 +1,19 @@
 /**
- * Unified relay handler for both chunk-based transfer and WebRTC signaling.
+ * Unified relay handler for chunk-based transfer and WebRTC signaling.
  * 
- * Chunk-based actions (legacy compatibility):
- * - send: Upload encrypted chunk
+ * Chunk-based actions (simplified unidirectional):
+ * - send: Upload encrypted chunk (no password needed, just invite code)
  * - receive: Poll for next chunk
- * - ack: Acknowledge receipt
- * - ack-status: Check acknowledgment status
- * - complete: Mark session as complete (sets 10s expiry)
  * - delete: Delete session immediately
  * 
- * WebRTC signaling actions (new):
+ * WebRTC signaling actions:
  * - register: Register peer with invite code
  * - lookup: Look up peer by invite code
  * - signal: Send signaling message (offer/answer/ICE)
  * - poll: Poll for signaling messages
  * 
  * All data is ephemeral - stored in memory only with dynamic TTL.
- * TTL is based on chunk count: 60s base + 500ms per chunk (max 180s).
+ * TTL formula: 30s (user input time) + (chunks * 500ms per chunk).
  * Server cannot read encrypted payloads (zero-trust).
  */
 
@@ -29,20 +26,16 @@ module.exports = async function relayHandler(req, res) {
   // ==================== Chunk-based Relay (legacy) ====================
   
   if (action === 'send') {
-    const { pin, passwordHash, chunkIndex, totalChunks, data, direction } = req.body;
-    if (!pin || !passwordHash || typeof chunkIndex !== 'number' || typeof totalChunks !== 'number' || !data) {
+    const { pin, chunkIndex, totalChunks, data } = req.body;
+    if (!pin || typeof chunkIndex !== 'number' || typeof totalChunks !== 'number' || !data) {
       return res.status(400).json({ error: 'missing_fields', status: 'waiting' });
     }
-    // direction: 'AtoB' or 'BtoA' for bidirectional support on single session
-    const dir = direction || 'AtoB';
     try {
       const result = await sessionManager.pushChunk({
         pin,
-        passwordHash,
         chunkIndex,
         totalChunks,
         data,
-        direction: dir,
       });
       return res.status(200).json(result);
     } catch (e) {
@@ -51,14 +44,12 @@ module.exports = async function relayHandler(req, res) {
   }
   
   if (action === 'receive') {
-    const { pin, passwordHash, direction } = req.body;
-    if (!pin || !passwordHash) {
-      return res.status(400).json({ status: 'waiting', error: 'missing_pin_or_passwordHash' });
+    const { pin } = req.body;
+    if (!pin) {
+      return res.status(400).json({ status: 'waiting', error: 'missing_pin' });
     }
-    // direction: 'AtoB' or 'BtoA' - receiver specifies which direction they want
-    const dir = direction || 'AtoB';
     try {
-      const result = await sessionManager.nextChunk({ pin, passwordHash, direction: dir });
+      const result = await sessionManager.nextChunk({ pin });
       if (result.status === 'chunkAvailable') {
         return res.status(200).json({
           status: 'chunkAvailable',
@@ -75,23 +66,12 @@ module.exports = async function relayHandler(req, res) {
     }
   }
   
-  if (action === 'ack') {
-    const { pin, passwordHash } = req.body;
-    if (!pin || !passwordHash) return res.status(400).json({ error: 'missing_fields' });
+  if (action === 'delete') {
+    const { pin } = req.body;
+    if (!pin) return res.status(400).json({ error: 'missing_pin' });
     try {
-      await sessionManager.setAcknowledged(pin, passwordHash);
-      return res.json({ ok: true });
-    } catch (e) {
-      return res.status(500).json({ error: 'server_error', details: e+'' });
-    }
-  }
-  
-  if (action === 'ack-status') {
-    const { pin, passwordHash } = req.body;
-    if (!pin || !passwordHash) return res.status(400).json({ error: 'missing_fields' });
-    try {
-      const ack = await sessionManager.getAcknowledged(pin, passwordHash);
-      return res.json({ acknowledged: !!ack });
+      const result = await sessionManager.deleteSession(pin);
+      return res.json(result);
     } catch (e) {
       return res.status(500).json({ error: 'server_error', details: e+'' });
     }
@@ -178,38 +158,6 @@ module.exports = async function relayHandler(req, res) {
 
   // ==================== Session Cleanup ====================
   
-  /**
-   * Mark a session as complete (for graceful cleanup).
-   * Sets a short expiry on the session.
-   */
-  if (action === 'complete') {
-    const { pin, passwordHash } = req.body;
-    if (!pin || !passwordHash) {
-      return res.status(400).json({ error: 'missing_fields' });
-    }
-    try {
-      const result = await sessionManager.markComplete(pin, passwordHash);
-      return res.status(200).json(result);
-    } catch (e) {
-      return res.status(500).json({ error: 'server_error', details: e+'' });
-    }
-  }
-  
-  /**
-   * Delete a session immediately (forceful cleanup).
-   */
-  if (action === 'delete') {
-    const { pin, passwordHash } = req.body;
-    if (!pin || !passwordHash) {
-      return res.status(400).json({ error: 'missing_fields' });
-    }
-    try {
-      const result = await sessionManager.deleteSession(pin, passwordHash);
-      return res.status(200).json(result);
-    } catch (e) {
-      return res.status(500).json({ error: 'server_error', details: e+'' });
-    }
-  }
 
   return res.status(404).json({ error: 'unknown_action' });
 };
