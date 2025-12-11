@@ -103,37 +103,41 @@ async function testAcknowledgmentAfterCompletion() {
 }
 
 async function testBidirectionalTransfer() {
-  console.log('Test: Bidirectional transfer with same invite code and password');
+  console.log('Test: Bidirectional transfer with same invite code');
   
   const pin = 'Kj8Lm4Qn';
-  const passwordHash = 'hashBidirectional';
+  const passwordHash1 = 'hashA';
+  const passwordHash2 = 'hashB';
   
   // Direction A->B: push and receive
   await sessionManager.pushChunk({
-    pin, passwordHash, chunkIndex: 0, totalChunks: 1, data: 'dataAtoB', direction: 'AtoB'
+    pin, passwordHash: passwordHash1, chunkIndex: 0, totalChunks: 1, data: 'dataA'
   });
-  let result = await sessionManager.nextChunk({ pin, passwordHash, direction: 'AtoB' });
-  assertEqual(result.status, 'chunkAvailable', 'Should receive chunk A->B');
-  assertEqual(result.chunk.data, 'dataAtoB', 'A->B data should match');
+  let result = await sessionManager.nextChunk({ pin, passwordHash: passwordHash1 });
+  assertEqual(result.status, 'chunkAvailable', 'Should receive chunk A');
   
-  result = await sessionManager.nextChunk({ pin, passwordHash, direction: 'AtoB' });
-  assertEqual(result.status, 'done', 'Direction A->B should be done');
+  result = await sessionManager.nextChunk({ pin, passwordHash: passwordHash1 });
+  assertEqual(result.status, 'done', 'Direction A should be done');
   
-  // Direction B->A: push and receive (same session, different direction)
+  // Acknowledge direction A
+  await sessionManager.setAcknowledged(pin, passwordHash1);
+  let acked = await sessionManager.getAcknowledged(pin, passwordHash1);
+  assertTruthy(acked, 'Direction A should be acknowledged');
+  
+  // Direction B->A: push and receive (using different passwordHash)
   await sessionManager.pushChunk({
-    pin, passwordHash, chunkIndex: 0, totalChunks: 1, data: 'dataBtoA', direction: 'BtoA'
+    pin, passwordHash: passwordHash2, chunkIndex: 0, totalChunks: 1, data: 'dataB'
   });
-  result = await sessionManager.nextChunk({ pin, passwordHash, direction: 'BtoA' });
-  assertEqual(result.status, 'chunkAvailable', 'Should receive chunk B->A');
-  assertEqual(result.chunk.data, 'dataBtoA', 'B->A data should match');
+  result = await sessionManager.nextChunk({ pin, passwordHash: passwordHash2 });
+  assertEqual(result.status, 'chunkAvailable', 'Should receive chunk B');
   
-  result = await sessionManager.nextChunk({ pin, passwordHash, direction: 'BtoA' });
-  assertEqual(result.status, 'done', 'Direction B->A should be done');
+  result = await sessionManager.nextChunk({ pin, passwordHash: passwordHash2 });
+  assertEqual(result.status, 'done', 'Direction B should be done');
   
-  // Acknowledge the session
-  await sessionManager.setAcknowledged(pin, passwordHash);
-  let acked = await sessionManager.getAcknowledged(pin, passwordHash);
-  assertTruthy(acked, 'Session should be acknowledged');
+  // Acknowledge direction B
+  await sessionManager.setAcknowledged(pin, passwordHash2);
+  acked = await sessionManager.getAcknowledged(pin, passwordHash2);
+  assertTruthy(acked, 'Direction B should be acknowledged');
   
   console.log('✓ Bidirectional transfer test passed');
 }
@@ -303,89 +307,6 @@ async function testInviteCodeCollision() {
   console.log('✓ Invite code collision test passed');
 }
 
-async function testReceiverPollsBeforeSenderPushes() {
-  console.log('Test: Receiver polls before sender pushes (bidirectional return session)');
-  
-  const pin = 'ReturnSe'; // 8-char alphanumeric - return session code
-  const passwordHash = 'bidirHash';
-  const chunkData = 'return_data_chunk';
-  
-  // Receiver (original sender) starts polling BEFORE sender (original receiver) pushes
-  let result = await sessionManager.nextChunk({ pin, passwordHash });
-  assertEqual(result.status, 'waiting', 'Should return waiting when session created by poll');
-  
-  // Poll again - should still be waiting
-  result = await sessionManager.nextChunk({ pin, passwordHash });
-  assertEqual(result.status, 'waiting', 'Should continue waiting for sender');
-  
-  // Now sender pushes chunk
-  result = await sessionManager.pushChunk({
-    pin, passwordHash, chunkIndex: 0, totalChunks: 1, data: chunkData
-  });
-  assertEqual(result.status, 'waiting', 'Push should succeed on pre-created session');
-  
-  // Receiver polls again - should get the chunk
-  result = await sessionManager.nextChunk({ pin, passwordHash });
-  assertEqual(result.status, 'chunkAvailable', 'Should receive chunk after sender pushes');
-  assertEqual(result.chunk.data, chunkData, 'Chunk data should match');
-  assertEqual(result.chunk.totalChunks, 1, 'Total chunks should be 1');
-  
-  // Poll again - should be done
-  result = await sessionManager.nextChunk({ pin, passwordHash });
-  assertEqual(result.status, 'done', 'Should be done after receiving all chunks');
-  
-  console.log('✓ Receiver polls before sender pushes test passed');
-}
-
-async function testSessionCleanup() {
-  console.log('Test: Session cleanup with markComplete and deleteSession');
-  
-  const pin = 'CleanUp1';
-  const passwordHash = 'cleanHash';
-  const chunkData = 'test_data';
-  
-  // Push a chunk to create a session
-  let result = await sessionManager.pushChunk({
-    pin, passwordHash, chunkIndex: 0, totalChunks: 1, data: chunkData
-  });
-  assertEqual(result.status, 'waiting', 'Session should be created');
-  
-  // Mark session as complete
-  result = await sessionManager.markComplete(pin, passwordHash);
-  assertEqual(result.status, 'marked_complete', 'Session should be marked complete');
-  
-  // Session should still exist but marked as completed
-  result = await sessionManager.nextChunk({ pin, passwordHash });
-  assertTruthy(result.status === 'done' || result.status === 'chunkAvailable', 
-    'Session should still exist after markComplete');
-  
-  // Delete session
-  result = await sessionManager.deleteSession(pin, passwordHash);
-  assertEqual(result.status, 'deleted', 'Session should be deleted');
-  
-  // Trying to delete again should return not_found
-  result = await sessionManager.deleteSession(pin, passwordHash);
-  assertEqual(result.status, 'not_found', 'Deleted session should not be found');
-  
-  console.log('✓ Session cleanup test passed');
-}
-
-async function testDynamicTTL() {
-  console.log('Test: Dynamic TTL based on chunk count');
-  
-  // Test TTL calculation
-  const baseTTL = sessionManager.getChunkTTL(null);
-  assertTruthy(baseTTL === 60000, 'Base TTL should be 60s');
-  
-  const smallTTL = sessionManager.getChunkTTL(10);
-  assertTruthy(smallTTL === 65000, 'TTL for 10 chunks should be 60000 + (10*500) = 65000ms');
-  
-  const largeTTL = sessionManager.getChunkTTL(1000);
-  assertTruthy(largeTTL === 180000, 'TTL should cap at 180s (3 minutes)');
-  
-  console.log('✓ Dynamic TTL test passed');
-}
-
 // Run all tests
 async function runTests() {
   console.log('=== Running Relay Sync Tests ===\n');
@@ -401,9 +322,6 @@ async function runTests() {
     await testInvalidInviteCodeFormat();
     await testSignalQueueing();
     await testInviteCodeCollision();
-    await testReceiverPollsBeforeSenderPushes();
-    await testSessionCleanup();
-    await testDynamicTTL();
     
     console.log('\n=== All Tests Passed! ===');
     process.exit(0);

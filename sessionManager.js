@@ -1,34 +1,19 @@
 /**
  * Ephemeral in-memory session manager for serverless signaling.
  * No Redis/database dependency - all data is stored in memory with TTL.
- * Simplified to unidirectional transfers only (A→B, no bidirectional sync).
+ * Supports both chunk-based relay and WebRTC signaling.
  * 
  * Invite codes are 8-character case-sensitive alphanumeric strings.
- * No password required - just the invite code.
  */
 
-// TTL formula: 30s (user input time) + (chunks * 500ms per chunk)
-const USER_INPUT_TIME_MS = 30000; // 30s for user to enter invite code
-const CHUNK_TTL_PER_CHUNK_MS = 500; // 500ms per chunk for transfer
-const SIGNAL_TTL_MS = 30000; // For WebRTC signaling
-
-/**
- * Calculate dynamic TTL based on total chunks.
- * Formula: 30s (user input) + (chunks * 500ms)
- * @param {number|null} totalChunks - Number of chunks, or null for base TTL
- * @returns {number} TTL in milliseconds
- */
-function getChunkTTL(totalChunks) {
-  if (!totalChunks || totalChunks <= 0) {
-    return USER_INPUT_TIME_MS;
-  }
-  // 30s for user input + 500ms per chunk
-  return USER_INPUT_TIME_MS + (totalChunks * CHUNK_TTL_PER_CHUNK_MS);
-}
+// TTL for sessions (30s for signaling, 60s for chunk relay)
+const SIGNAL_TTL_MS = 30000;
+const CHUNK_TTL_MS = 60000;
 
 // In-memory stores (ephemeral, cleared on function cold start)
 const sessions = new Map();        // inviteCode -> SessionData
 const signalQueues = new Map();    // peerId -> [SignalMessage]
+const ackStore = new Map();        // inviteCode:passwordHash -> { acknowledged, expires }
 
 function now() { return Date.now(); }
 
@@ -52,16 +37,31 @@ function purgeExpired() {
       signalQueues.set(peerId, filtered);
     }
   }
+  
+  // Purge expired ack entries
+  for (const [key, ack] of ackStore.entries()) {
+    if (ack.expires < cutoff) {
+      ackStore.delete(key);
+    }
+  }
 }
 
-// ==================== Unidirectional Chunk Relay ====================
+// Use a separator that cannot appear in base64-encoded passwordHash or alphanumeric invite codes
+function sessionKey(inviteCode, passwordHash) {
+  // Both inviteCode (alphanumeric) and passwordHash (base64) are URL-safe
+  // Using a null character as separator to avoid any possible collision
+  return `sess\x00${inviteCode}\x00${passwordHash}`;
+}
 
-async function pushChunk({ pin, chunkIndex, totalChunks, data }) {
-  // 'pin' is an 8-character invite code (no password needed)
+// ==================== Chunk-based Relay (legacy compatibility) ====================
+
+async function pushChunk({ pin, passwordHash, chunkIndex, totalChunks, data }) {
+  // 'pin' is now an 8-character invite code
   const inviteCode = pin;
   
   if (
     typeof inviteCode !== 'string' ||
+    typeof passwordHash !== 'string' ||
     typeof chunkIndex !== 'number' ||
     typeof totalChunks !== 'number' ||
     typeof data !== 'string' ||
@@ -76,134 +76,124 @@ async function pushChunk({ pin, chunkIndex, totalChunks, data }) {
   
   purgeExpired();
   
-  let sess = sessions.get(inviteCode);
-  const ttl = getChunkTTL(totalChunks);
+  const key = sessionKey(inviteCode, passwordHash);
+  let sess = sessions.get(key);
   
   if (!sess) {
-    // Create new session (unidirectional)
     sess = {
       created: now(),
       lastTouched: now(),
-      expires: now() + ttl,
-      totalChunks: totalChunks,
+      expires: now() + CHUNK_TTL_MS,
+      totalChunks,
       chunks: new Map(),
       delivered: new Set(),
       completed: false,
-      ttl, // Store TTL for future refreshes
     };
-    sessions.set(inviteCode, sess);
-  } else if (sess.totalChunks === null) {
-    // Upgrade placeholder session created by receiver
-    sess.totalChunks = totalChunks;
-    sess.ttl = ttl;
-    sess.expires = now() + ttl;
-    sess.waitingForSender = false;
-  } else if (sess.totalChunks !== totalChunks) {
-    // Validate totalChunks matches
-    return { error: 'totalChunks_mismatch', status: 'waiting' };
-  }
-  
-  // Check for duplicate
-  if (sess.delivered.has(chunkIndex) || sess.chunks.has(chunkIndex)) {
-    return { error: 'duplicate_chunk', status: 'waiting' };
+    sessions.set(key, sess);
+  } else {
+    if (sess.totalChunks !== totalChunks) {
+      return { error: 'totalChunks_mismatch', status: 'waiting' };
+    }
+    if (sess.delivered.has(chunkIndex) || sess.chunks.has(chunkIndex)) {
+      return { error: 'duplicate_chunk', status: 'waiting' };
+    }
   }
   
   sess.chunks.set(chunkIndex, data);
   sess.lastTouched = now();
-  sess.expires = now() + (sess.ttl || ttl);
+  sess.expires = now() + CHUNK_TTL_MS;
   
   return { status: 'waiting' };
 }
 
-async function nextChunk({ pin }) {
+async function nextChunk({ pin, passwordHash }) {
   const inviteCode = pin;
   purgeExpired();
   
-  let sess = sessions.get(inviteCode);
+  const key = sessionKey(inviteCode, passwordHash);
+  const sess = sessions.get(key);
   
   if (!sess) {
-    // Create a placeholder session so the receiver can start waiting
-    const ttl = getChunkTTL(null); // Use base TTL for placeholder
-    sess = {
-      created: now(),
-      lastTouched: now(),
-      expires: now() + ttl,
-      totalChunks: null,
-      chunks: new Map(),
-      delivered: new Set(),
-      completed: false,
-      waitingForSender: true,
-      ttl,
-    };
-    sessions.set(inviteCode, sess);
-    return { status: 'waiting' };
-  }
-  
-  const sessionTTL = sess.ttl || getChunkTTL(sess.totalChunks);
-  
-  if (now() - sess.lastTouched > sessionTTL * 2) {
-    sessions.delete(inviteCode);
     return { status: 'expired' };
   }
   
-  // If still waiting for sender to push first chunk
-  if (sess.waitingForSender && sess.totalChunks === null) {
-    sess.lastTouched = now();
-    sess.expires = now() + sessionTTL;
-    return { status: 'waiting' };
+  if (now() - sess.lastTouched > CHUNK_TTL_MS) {
+    sessions.delete(key);
+    return { status: 'expired' };
   }
   
   // If already completed
   if (sess.completed) {
+    const ackKey = sessionKey(inviteCode, passwordHash);
+    const ack = ackStore.get(ackKey);
+    if (ack && ack.acknowledged) {
+      sessions.delete(key);
+      ackStore.delete(ackKey);
+    }
     return { status: 'done' };
   }
   
   // Find next available chunk
-  if (sess.totalChunks) {
-    for (let i = 0; i < sess.totalChunks; i++) {
-      if (sess.chunks.has(i) && !sess.delivered.has(i)) {
-        const data = sess.chunks.get(i);
-        sess.chunks.delete(i);
-        sess.delivered.add(i);
-        sess.lastTouched = now();
-        sess.expires = now() + sessionTTL;
-        
-        return {
-          status: 'chunkAvailable',
-          chunk: {
-            chunkIndex: i,
-            totalChunks: sess.totalChunks,
-            data,
-          },
-        };
-      }
-    }
-    
-    // Check if all chunks delivered
-    if (sess.delivered.size === sess.totalChunks) {
-      sess.completed = true;
-      sess.chunks.clear();
-      return { status: 'done' };
+  for (let i = 0; i < sess.totalChunks; i++) {
+    if (sess.chunks.has(i) && !sess.delivered.has(i)) {
+      const data = sess.chunks.get(i);
+      sess.chunks.delete(i);
+      sess.delivered.add(i);
+      sess.lastTouched = now();
+      sess.expires = now() + CHUNK_TTL_MS;
+      
+      return {
+        status: 'chunkAvailable',
+        chunk: {
+          chunkIndex: i,
+          totalChunks: sess.totalChunks,
+          data,
+        },
+      };
     }
   }
   
-  // Keep session alive while actively polling
-  sess.lastTouched = now();
-  sess.expires = now() + sessionTTL;
+  // Check if all chunks delivered
+  if (sess.delivered.size === sess.totalChunks) {
+    sess.completed = true;
+    sess.chunks.clear();
+    return { status: 'done' };
+  }
   
   return { status: 'waiting' };
 }
 
-/**
- * Delete a session immediately.
- */
-async function deleteSession(pin) {
+async function setAcknowledged(pin, passwordHash) {
   const inviteCode = pin;
   purgeExpired();
   
-  const deleted = sessions.delete(inviteCode);
+  const key = sessionKey(inviteCode, passwordHash);
+  ackStore.set(key, {
+    acknowledged: true,
+    expires: now() + CHUNK_TTL_MS,
+  });
   
-  return { status: deleted ? 'deleted' : 'not_found' };
+  // Update session if exists
+  const sess = sessions.get(key);
+  if (sess) {
+    sess.acknowledged = true;
+    sess.lastTouched = now();
+    sess.expires = now() + CHUNK_TTL_MS;
+  }
+}
+
+async function getAcknowledged(pin, passwordHash) {
+  const inviteCode = pin;
+  purgeExpired();
+  
+  const key = sessionKey(inviteCode, passwordHash);
+  const ack = ackStore.get(key);
+  if (ack && ack.acknowledged) {
+    return true;
+  }
+  
+  const sess = sessions.get(key);
+  return sess && sess.acknowledged === true;
 }
 
 // ==================== WebRTC Signaling ====================
@@ -312,12 +302,16 @@ function lookupPeer(inviteCode) {
   return { peerId: sess.peerId };
 }
 
+const TTL_MS = CHUNK_TTL_MS;
+
 module.exports = {
-  // Chunk relay (unidirectional)
+  // Chunk relay (legacy)
   pushChunk,
   nextChunk,
-  deleteSession,
+  setAcknowledged,
+  getAcknowledged,
   purgeExpired,
+  TTL_MS,
   
   // WebRTC signaling
   queueSignal,
@@ -327,7 +321,5 @@ module.exports = {
   
   // Constants
   SIGNAL_TTL_MS,
-  USER_INPUT_TIME_MS,
-  CHUNK_TTL_PER_CHUNK_MS,
-  getChunkTTL,
+  CHUNK_TTL_MS,
 };
