@@ -5,16 +5,19 @@
   "scripts": {
     "start": "vercel dev",
     "serve": "node server.js",
-    "test": "node test/relay-test.js"
+    "test": "node test/relay-test.js",
+    "test:comprehensive": "node test/comprehensive-test.js",
+    "test:all": "npm run test && npm run test:comprehensive"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "description": "Serverless signaling server for QSafeVault P2P sync. No database, ephemeral memory only.",
   "engines": {
-    "node": ">=18"
+    "node": ">=24"
   },
   "dependencies": {
+    "express": "^5.2.1",
     "uuid": "^9.0.1"
   }
 }

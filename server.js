@@ -1,7 +1,41 @@
+/**
+ * QSafeVault Server
+ * 
+ * Zero-knowledge signaling server for P2P sync
+ * 
+ * SECURITY PRINCIPLES:
+ * - No account database
+ * - No vault data storage beyond encrypted blobs
+ * - Server never decrypts vault data
+ * - Server never generates cryptographic keys
+ * - All secrets live on user devices
+ * 
+ * EDITION SYSTEM:
+ * - Consumer: Stateless relay, ephemeral storage, public deployment allowed
+ * - Enterprise: Device registry, audit logging, self-hosted only
+ */
 
 const express = require('express');
+const { getEditionConfig } = require('./editionConfig');
+
+// Initialize edition configuration first (will fail fast on misconfiguration)
+let editionConfig;
+try {
+  editionConfig = getEditionConfig();
+} catch (error) {
+  console.error('FATAL: Server configuration error');
+  console.error(error.message);
+  process.exit(1);
+}
+
 const app = express();
 app.use(express.json({ limit: '70kb' }));
+
+// Make edition config available to routes
+app.use((req, res, next) => {
+  req.editionConfig = editionConfig;
+  next();
+});
 
 const relayHandler = require('./api/relay');
 const sessionsIndex = require('./api/v1/sessions/index');
@@ -11,6 +45,11 @@ const sessionAnswer = require('./api/v1/sessions/[sessionId]/answer');
 const sessionDelete = require('./api/v1/sessions/[sessionId]/index');
 const registerDevice = require('./api/v1/devices/index').registerDevice;
 const listDevices = require('./api/v1/devices/[userId]');
+
+// Edition handshake endpoint - clients use this to verify server edition
+app.get('/api/v1/edition', (req, res) => {
+  res.json(editionConfig.getEditionInfo());
+});
 
 app.all('/api/relay', relayHandler);
 
