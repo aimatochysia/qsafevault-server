@@ -13,7 +13,8 @@
  * - signal: Send signaling message (offer/answer/ICE)
  * - poll: Poll for signaling messages
  * 
- * All data is ephemeral - stored in memory only with short TTL.
+ * All data is ephemeral - stored in Vercel Blob with short TTL.
+ * Data is deleted after use (single-read) or on expiration.
  * Server cannot read encrypted payloads (zero-trust).
  */
 
@@ -101,7 +102,7 @@ module.exports = async function relayHandler(req, res) {
       return res.status(400).json({ error: 'missing_fields' });
     }
     try {
-      const result = sessionManager.registerPeer(inviteCode, peerId);
+      const result = await sessionManager.registerPeer(inviteCode, peerId);
       if (result.error) {
         return res.status(400).json(result);
       }
@@ -120,7 +121,7 @@ module.exports = async function relayHandler(req, res) {
       return res.status(400).json({ error: 'missing_invite_code' });
     }
     try {
-      const result = sessionManager.lookupPeer(inviteCode);
+      const result = await sessionManager.lookupPeer(inviteCode);
       if (result.error) {
         return res.status(404).json(result);
       }
@@ -141,7 +142,7 @@ module.exports = async function relayHandler(req, res) {
       return res.status(400).json({ error: 'missing_fields' });
     }
     try {
-      const result = sessionManager.queueSignal({ from, to, type, payload });
+      const result = await sessionManager.queueSignal({ from, to, type, payload });
       if (result.error) {
         return res.status(400).json(result);
       }
@@ -161,7 +162,7 @@ module.exports = async function relayHandler(req, res) {
       return res.status(400).json({ error: 'missing_peer_id' });
     }
     try {
-      const result = sessionManager.pollSignals(peerId);
+      const result = await sessionManager.pollSignals(peerId);
       return res.status(200).json(result);
     } catch (e) {
       return res.status(500).json({ error: 'server_error', details: e+'' });
