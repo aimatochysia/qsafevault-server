@@ -114,6 +114,7 @@ async function writeStorage(key, data) {
     await blob.put(key, json, {
       access: 'public',
       addRandomSuffix: false,
+      allowOverwrite: true,
       contentType: 'application/json',
     });
   } else {
