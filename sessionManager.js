@@ -17,6 +17,12 @@
 const SIGNAL_TTL_MS = 30000;
 const CHUNK_TTL_MS = 60000;
 
+// Optimistic concurrency control constants
+const MAX_PUSH_RETRIES = 5;
+const INITIAL_BACKOFF_MS = 50;
+const MAX_BACKOFF_MS = 500;
+const JITTER_MS = 50;
+
 function now() { return Date.now(); }
 
 // ==================== Storage Backend ====================
@@ -248,6 +254,11 @@ async function purgeExpired() {
 
 // ==================== Chunk-based Relay (legacy compatibility) ====================
 
+/**
+ * Push a chunk with optimistic concurrency control.
+ * Uses retry logic to handle concurrent writes from parallel requests.
+ * Each retry re-reads the session to get the latest state before writing.
+ */
 async function pushChunk({ pin, passwordHash, chunkIndex, totalChunks, data }) {
   // 'pin' is now an 8-character invite code
   const inviteCode = pin;
@@ -268,34 +279,60 @@ async function pushChunk({ pin, passwordHash, chunkIndex, totalChunks, data }) {
   }
   
   const key = sessionKey(inviteCode, passwordHash);
-  let sess = await readStorage(key);
   
-  if (!sess) {
-    sess = {
-      created: now(),
-      lastTouched: now(),
-      expires: now() + CHUNK_TTL_MS,
-      totalChunks,
-      chunks: {},        // Object instead of Map for JSON serialization
-      delivered: [],     // Array instead of Set for JSON serialization
-      completed: false,
-    };
-  } else {
-    if (sess.totalChunks !== totalChunks) {
-      return { error: 'totalChunks_mismatch', status: 'waiting' };
+  for (let attempt = 0; attempt < MAX_PUSH_RETRIES; attempt++) {
+    // Read current session state
+    let sess = await readStorage(key);
+    
+    if (!sess) {
+      sess = {
+        created: now(),
+        lastTouched: now(),
+        expires: now() + CHUNK_TTL_MS,
+        totalChunks,
+        chunks: {},        // Object instead of Map for JSON serialization
+        delivered: [],     // Array instead of Set for JSON serialization
+        completed: false,
+        version: 0,
+      };
+    } else {
+      if (sess.totalChunks !== totalChunks) {
+        return { error: 'totalChunks_mismatch', status: 'waiting' };
+      }
+      if (sess.delivered.includes(chunkIndex) || sess.chunks[chunkIndex] !== undefined) {
+        return { error: 'duplicate_chunk', status: 'waiting' };
+      }
     }
-    if (sess.delivered.includes(chunkIndex) || sess.chunks[chunkIndex] !== undefined) {
-      return { error: 'duplicate_chunk', status: 'waiting' };
+    
+    // Add the chunk and increment version
+    // Store the expected version for verification
+    const expectedVersion = (sess.version || 0) + 1;
+    sess.chunks[chunkIndex] = data;
+    sess.lastTouched = now();
+    sess.expires = now() + CHUNK_TTL_MS;
+    sess.version = expectedVersion;
+    
+    // Write the updated session
+    await writeStorage(key, sess);
+    
+    // Verify the write succeeded by re-reading and checking both data and version
+    const verifySession = await readStorage(key);
+    if (verifySession && 
+        verifySession.chunks[chunkIndex] === data && 
+        verifySession.version >= expectedVersion) {
+      // Write succeeded - our chunk is present
+      // Note: version may be higher if another concurrent write also succeeded,
+      // but as long as our chunk is there, we consider it a success
+      return { status: 'waiting' };
     }
+    
+    // Write was overwritten by concurrent request, retry with exponential backoff
+    const backoffMs = Math.min(INITIAL_BACKOFF_MS * Math.pow(2, attempt), MAX_BACKOFF_MS) + Math.random() * JITTER_MS;
+    await new Promise(r => setTimeout(r, backoffMs));
   }
   
-  sess.chunks[chunkIndex] = data;
-  sess.lastTouched = now();
-  sess.expires = now() + CHUNK_TTL_MS;
-  
-  await writeStorage(key, sess);
-  
-  return { status: 'waiting' };
+  // All retries exhausted - return error
+  return { error: 'concurrency_conflict', status: 'waiting' };
 }
 
 async function nextChunk({ pin, passwordHash }) {

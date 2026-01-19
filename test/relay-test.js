@@ -322,6 +322,7 @@ async function runTests() {
     await testInvalidInviteCodeFormat();
     await testSignalQueueing();
     await testInviteCodeCollision();
+    await testConcurrentChunkWrites();
     
     console.log('\n=== All Tests Passed! ===');
     process.exit(0);
@@ -330,6 +331,55 @@ async function runTests() {
     console.error(error.stack);
     process.exit(1);
   }
+}
+
+/**
+ * Test concurrent chunk writes - simulates cross-device sync scenario
+ * where multiple chunks are sent in parallel via Promise.all
+ */
+async function testConcurrentChunkWrites() {
+  console.log('Test: Concurrent chunk writes (cross-device sync)');
+  
+  const pin = 'Cc8Dd9Ee';
+  const passwordHash = `concurrent-${Date.now()}`;
+  const numChunks = 3;
+  
+  // Push all chunks concurrently (simulates Promise.all in the test)
+  const pushPromises = [];
+  for (let i = 0; i < numChunks; i++) {
+    pushPromises.push(
+      sessionManager.pushChunk({
+        pin,
+        passwordHash,
+        chunkIndex: i,
+        totalChunks: numChunks,
+        data: `chunk-data-${i}`,
+      })
+    );
+  }
+  
+  const pushResults = await Promise.all(pushPromises);
+  
+  // All pushes should succeed (status: 'waiting')
+  pushResults.forEach((result, i) => {
+    assertEqual(result.status, 'waiting', `Chunk ${i} push should return waiting`);
+    assertFalsy(result.error, `Chunk ${i} push should not have error`);
+  });
+  
+  // Now receive all chunks
+  const receivedChunks = [];
+  for (let i = 0; i < numChunks; i++) {
+    const result = await sessionManager.nextChunk({ pin, passwordHash });
+    if (result.status === 'chunkAvailable') {
+      receivedChunks.push(result.chunk.chunkIndex);
+    }
+  }
+  
+  // Sort and compare
+  receivedChunks.sort((a, b) => a - b);
+  assertEqual(receivedChunks, [0, 1, 2], 'All chunks should be received');
+  
+  console.log(`✓ Concurrent chunk writes test passed (${numChunks} chunks)`);
 }
 
 // Run tests if called directly
