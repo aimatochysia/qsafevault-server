@@ -460,14 +460,8 @@ async function queueSignal({ from, to, type, payload }) {
   
   const queueKey = storageKey('signal', to);
   
-  // Create the message to be queued
-  const message = {
-    from,
-    type,
-    payload,
-    timestamp: now(),
-    expires: now() + SIGNAL_TTL_MS,
-  };
+  // Generate unique message ID to track this specific message through retries
+  const messageId = `${from}-${type}-${now()}-${Math.random().toString(36).slice(2, 10)}`;
   
   // Optimistic concurrency control: retry if write conflicts occur
   for (let attempt = 0; attempt < MAX_PUSH_RETRIES; attempt++) {
@@ -484,10 +478,21 @@ async function queueSignal({ from, to, type, payload }) {
     // Filter out expired messages
     queue.messages = queue.messages.filter(m => m.expires > now());
     
+    // Create the message with current timestamp
+    const currentTime = now();
+    const message = {
+      id: messageId,
+      from,
+      type,
+      payload,
+      timestamp: currentTime,
+      expires: currentTime + SIGNAL_TTL_MS,
+    };
+    
     // Add the new message and increment version
     const expectedVersion = (queue.version || 0) + 1;
-    queue.messages.push({ ...message, timestamp: now(), expires: now() + SIGNAL_TTL_MS });
-    queue.expires = now() + SIGNAL_TTL_MS;
+    queue.messages.push(message);
+    queue.expires = currentTime + SIGNAL_TTL_MS;
     queue.version = expectedVersion;
     
     // Write the updated queue
@@ -496,10 +501,8 @@ async function queueSignal({ from, to, type, payload }) {
     // Verify the write succeeded by checking version and message presence
     const verifyQueue = await readStorage(queueKey);
     if (verifyQueue && verifyQueue.version >= expectedVersion) {
-      // Check if our message is in the queue (compare by timestamp and from)
-      const messageFound = verifyQueue.messages.some(
-        m => m.from === from && m.type === type && m.payload === payload
-      );
+      // Check if our specific message is in the queue (by unique ID)
+      const messageFound = verifyQueue.messages.some(m => m.id === messageId);
       if (messageFound) {
         return { status: 'queued' };
       }
@@ -510,8 +513,8 @@ async function queueSignal({ from, to, type, payload }) {
     await new Promise(r => setTimeout(r, backoffMs));
   }
   
-  // All retries exhausted - return error
-  return { error: 'concurrency_conflict', status: 'queued' };
+  // All retries exhausted - return error status
+  return { error: 'concurrency_conflict' };
 }
 
 /**

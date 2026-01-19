@@ -790,6 +790,7 @@ async function testMultiUserConcurrentSync() {
   for (let i = 0; i < numPairs; i++) {
     syncPairs.push({
       name: `Pair${i}`,
+      index: i,  // Store index for efficient lookup
       pin: generateRandomPin(),
       passwordHash: `multiuser-${i}-${Date.now()}`,
       chunks: Array.from({ length: chunksPerSession }, (_, j) => `pair${i}-chunk${j}-data`),
@@ -848,10 +849,10 @@ async function testMultiUserConcurrentSync() {
     const received = receiveResults[pair.name];
     assertEqual(received.length, chunksPerSession, `${pair.name} should receive ${chunksPerSession} chunks`);
     
-    // Verify data integrity - each chunk should belong to this pair
+    // Verify data integrity - each chunk should belong to this pair (use stored index)
     for (const chunk of received) {
       assertTruthy(
-        chunk.data.startsWith(`pair${syncPairs.indexOf(pair)}-`),
+        chunk.data.startsWith(`pair${pair.index}-`),
         `${pair.name} chunk data should match expected pattern`
       );
     }
