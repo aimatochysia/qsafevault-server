@@ -772,6 +772,283 @@ async function testMemoryPressure() {
   console.log(`✓ Memory pressure test completed (${numPayloads * payloadSize / 1024}KB total)`);
 }
 
+// ==================== Multi-User Concurrent Sync Tests ====================
+
+/**
+ * Test: Multiple user pairs syncing simultaneously
+ * Verifies: A→B, C→D, E→F can all sync at the same time without interference
+ * As per SERVER_SPEC.md section "Multi-User Concurrent Sync"
+ */
+async function testMultiUserConcurrentSync() {
+  console.log('Test: Multi-user concurrent sync (5 user pairs syncing simultaneously)');
+  
+  const numPairs = 5;
+  const chunksPerSession = 3;
+  
+  // Create 5 independent sync sessions (A→B, C→D, E→F, G→H, I→J)
+  const syncPairs = [];
+  for (let i = 0; i < numPairs; i++) {
+    syncPairs.push({
+      name: `Pair${i}`,
+      pin: generateRandomPin(),
+      passwordHash: `multiuser-${i}-${Date.now()}`,
+      chunks: Array.from({ length: chunksPerSession }, (_, j) => `pair${i}-chunk${j}-data`),
+    });
+  }
+  
+  const startTime = Date.now();
+  
+  // Phase 1: All senders push chunks concurrently
+  const sendPromises = [];
+  for (const pair of syncPairs) {
+    for (let chunkIndex = 0; chunkIndex < pair.chunks.length; chunkIndex++) {
+      sendPromises.push(
+        sessionManager.pushChunk({
+          pin: pair.pin,
+          passwordHash: pair.passwordHash,
+          chunkIndex,
+          totalChunks: pair.chunks.length,
+          data: pair.chunks[chunkIndex],
+        }).then(result => ({ pair: pair.name, chunkIndex, result }))
+      );
+    }
+  }
+  
+  const sendResults = await Promise.all(sendPromises);
+  
+  // Verify all sends succeeded
+  const sendSuccesses = sendResults.filter(r => r.result.status === 'waiting');
+  assertEqual(
+    sendSuccesses.length,
+    numPairs * chunksPerSession,
+    `All ${numPairs * chunksPerSession} sends should succeed`
+  );
+  
+  // Phase 2: All receivers poll chunks concurrently
+  const receiveResults = {};
+  for (const pair of syncPairs) {
+    receiveResults[pair.name] = [];
+  }
+  
+  // Each pair receives all their chunks
+  for (const pair of syncPairs) {
+    for (let i = 0; i < chunksPerSession; i++) {
+      const result = await sessionManager.nextChunk({
+        pin: pair.pin,
+        passwordHash: pair.passwordHash,
+      });
+      if (result.status === 'chunkAvailable') {
+        receiveResults[pair.name].push(result.chunk);
+      }
+    }
+  }
+  
+  // Verify each pair received exactly their chunks (no cross-contamination)
+  for (const pair of syncPairs) {
+    const received = receiveResults[pair.name];
+    assertEqual(received.length, chunksPerSession, `${pair.name} should receive ${chunksPerSession} chunks`);
+    
+    // Verify data integrity - each chunk should belong to this pair
+    for (const chunk of received) {
+      assertTruthy(
+        chunk.data.startsWith(`pair${syncPairs.indexOf(pair)}-`),
+        `${pair.name} chunk data should match expected pattern`
+      );
+    }
+  }
+  
+  const elapsed = Date.now() - startTime;
+  console.log(`  Completed ${numPairs} concurrent sync sessions in ${elapsed}ms`);
+  console.log('✓ Multi-user concurrent sync test passed (no cross-contamination)');
+}
+
+/**
+ * Test: Cross-device sync - same user syncing to multiple devices
+ * Verifies: User with devices A, B, C can have A→B and A→C syncs running
+ * Each sync uses different passwordHash to isolate the session
+ */
+async function testCrossDeviceSync() {
+  console.log('Test: Cross-device sync (same user, 3 device pairs)');
+  
+  const userId = 'user-12345';
+  const devices = ['deviceA', 'deviceB', 'deviceC', 'deviceD'];
+  
+  // Create sync sessions: A→B, A→C, B→D (all using same invite code but different password hashes)
+  const syncSessions = [
+    { from: 'deviceA', to: 'deviceB', pin: generateRandomPin(), passwordHash: `${userId}-A-B` },
+    { from: 'deviceA', to: 'deviceC', pin: generateRandomPin(), passwordHash: `${userId}-A-C` },
+    { from: 'deviceB', to: 'deviceD', pin: generateRandomPin(), passwordHash: `${userId}-B-D` },
+  ];
+  
+  const chunksPerSync = 2;
+  
+  // All devices send chunks concurrently
+  const sendPromises = [];
+  for (const session of syncSessions) {
+    for (let i = 0; i < chunksPerSync; i++) {
+      sendPromises.push(
+        sessionManager.pushChunk({
+          pin: session.pin,
+          passwordHash: session.passwordHash,
+          chunkIndex: i,
+          totalChunks: chunksPerSync,
+          data: `${session.from}-to-${session.to}-chunk${i}`,
+        }).then(result => ({ session, chunkIndex: i, result }))
+      );
+    }
+  }
+  
+  const sendResults = await Promise.all(sendPromises);
+  
+  // Verify all sends succeeded
+  const sendSuccesses = sendResults.filter(r => r.result.status === 'waiting');
+  assertEqual(
+    sendSuccesses.length,
+    syncSessions.length * chunksPerSync,
+    'All cross-device sends should succeed'
+  );
+  
+  // Each receiver polls their chunks
+  for (const session of syncSessions) {
+    const received = [];
+    for (let i = 0; i < chunksPerSync; i++) {
+      const result = await sessionManager.nextChunk({
+        pin: session.pin,
+        passwordHash: session.passwordHash,
+      });
+      if (result.status === 'chunkAvailable') {
+        received.push(result.chunk);
+      }
+    }
+    
+    assertEqual(received.length, chunksPerSync, `${session.from}→${session.to} should receive ${chunksPerSync} chunks`);
+    
+    // Verify data integrity
+    for (const chunk of received) {
+      assertTruthy(
+        chunk.data.startsWith(`${session.from}-to-${session.to}`),
+        `Chunk data should match ${session.from}→${session.to} pattern`
+      );
+    }
+  }
+  
+  console.log('✓ Cross-device sync test passed (3 concurrent device pairs)');
+}
+
+/**
+ * Test: Concurrent signal queueing (multiple ICE candidates)
+ * Verifies: Multiple ICE candidates can be queued concurrently without loss
+ */
+async function testConcurrentSignalQueueing() {
+  console.log('Test: Concurrent signal queueing (10 ICE candidates simultaneously)');
+  
+  const fromPeer = `sender-${Date.now()}`;
+  const toPeer = `receiver-${Date.now()}`;
+  const numCandidates = 10;
+  
+  // Queue 10 ICE candidates concurrently
+  const queuePromises = [];
+  for (let i = 0; i < numCandidates; i++) {
+    queuePromises.push(
+      sessionManager.queueSignal({
+        from: fromPeer,
+        to: toPeer,
+        type: 'ice-candidate',
+        payload: `{"candidate":"candidate-${i}","sdpMid":"0","sdpMLineIndex":${i}}`,
+      })
+    );
+  }
+  
+  const queueResults = await Promise.all(queuePromises);
+  
+  // Verify all signals were queued
+  const queued = queueResults.filter(r => r.status === 'queued');
+  assertEqual(queued.length, numCandidates, `All ${numCandidates} signals should be queued`);
+  
+  // Poll and verify all messages are received
+  const pollResult = await sessionManager.pollSignals(toPeer);
+  assertEqual(
+    pollResult.messages.length,
+    numCandidates,
+    `Should receive all ${numCandidates} ICE candidates`
+  );
+  
+  // Verify all candidates are present (order may vary due to concurrency)
+  const receivedPayloads = new Set(pollResult.messages.map(m => m.payload));
+  for (let i = 0; i < numCandidates; i++) {
+    const expectedPayload = `{"candidate":"candidate-${i}","sdpMid":"0","sdpMLineIndex":${i}}`;
+    assertTruthy(
+      receivedPayloads.has(expectedPayload),
+      `Candidate ${i} should be in received messages`
+    );
+  }
+  
+  console.log('✓ Concurrent signal queueing test passed (no message loss)');
+}
+
+/**
+ * Test: Mixed concurrent operations
+ * Verifies: Chunk relay and WebRTC signaling can work simultaneously
+ */
+async function testMixedConcurrentOperations() {
+  console.log('Test: Mixed concurrent operations (chunks + signals)');
+  
+  const chunkPin = generateRandomPin();
+  const chunkPasswordHash = `mixed-${Date.now()}`;
+  const peerId = `peer-${Date.now()}`;
+  
+  // Run chunk operations and signal operations concurrently
+  const operations = [
+    // Chunk operations
+    sessionManager.pushChunk({
+      pin: chunkPin,
+      passwordHash: chunkPasswordHash,
+      chunkIndex: 0,
+      totalChunks: 2,
+      data: 'mixed-chunk-0',
+    }),
+    sessionManager.pushChunk({
+      pin: chunkPin,
+      passwordHash: chunkPasswordHash,
+      chunkIndex: 1,
+      totalChunks: 2,
+      data: 'mixed-chunk-1',
+    }),
+    // Signal operations
+    sessionManager.queueSignal({
+      from: 'sender',
+      to: peerId,
+      type: 'offer',
+      payload: '{"sdp":"mixed-offer"}',
+    }),
+    sessionManager.queueSignal({
+      from: 'sender',
+      to: peerId,
+      type: 'ice-candidate',
+      payload: '{"candidate":"mixed-ice"}',
+    }),
+  ];
+  
+  const results = await Promise.all(operations);
+  
+  // Verify chunk operations succeeded
+  assertEqual(results[0].status, 'waiting', 'Chunk 0 should be accepted');
+  assertEqual(results[1].status, 'waiting', 'Chunk 1 should be accepted');
+  
+  // Verify signal operations succeeded
+  assertEqual(results[2].status, 'queued', 'Offer should be queued');
+  assertEqual(results[3].status, 'queued', 'ICE candidate should be queued');
+  
+  // Verify data retrieval works
+  const chunk0 = await sessionManager.nextChunk({ pin: chunkPin, passwordHash: chunkPasswordHash });
+  assertEqual(chunk0.status, 'chunkAvailable', 'Chunk 0 should be available');
+  
+  const signals = await sessionManager.pollSignals(peerId);
+  assertEqual(signals.messages.length, 2, 'Both signals should be available');
+  
+  console.log('✓ Mixed concurrent operations test passed');
+}
+
 // ==================== Security Middleware Tests ====================
 
 async function testSecurityHeaders() {
@@ -860,6 +1137,12 @@ async function runAllTests() {
     await testConcurrentSessions();
     await testConcurrentWritesToSameSession();
     await testRapidFireRequests();
+    
+    console.log('\n--- Multi-User Concurrent Sync Tests ---');
+    await testMultiUserConcurrentSync();
+    await testCrossDeviceSync();
+    await testConcurrentSignalQueueing();
+    await testMixedConcurrentOperations();
     
     console.log('\n--- Security Tests ---');
     await testInviteCodeInjection();

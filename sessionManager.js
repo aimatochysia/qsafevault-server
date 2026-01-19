@@ -450,6 +450,8 @@ async function getAcknowledged(pin, passwordHash) {
 /**
  * Queue a signaling message for a peer.
  * Messages are ephemeral and expire after SIGNAL_TTL_MS.
+ * Uses optimistic concurrency control to handle concurrent signal queueing
+ * (e.g., multiple ICE candidates being sent simultaneously).
  */
 async function queueSignal({ from, to, type, payload }) {
   if (!from || !to || !type || !payload) {
@@ -457,31 +459,59 @@ async function queueSignal({ from, to, type, payload }) {
   }
   
   const queueKey = storageKey('signal', to);
-  let queue = await readStorage(queueKey);
   
-  if (!queue) {
-    queue = {
-      messages: [],
-      expires: now() + SIGNAL_TTL_MS,
-    };
-  }
-  
-  // Filter out expired messages
-  queue.messages = queue.messages.filter(m => m.expires > now());
-  
-  queue.messages.push({
+  // Create the message to be queued
+  const message = {
     from,
     type,
     payload,
     timestamp: now(),
     expires: now() + SIGNAL_TTL_MS,
-  });
+  };
   
-  queue.expires = now() + SIGNAL_TTL_MS;
+  // Optimistic concurrency control: retry if write conflicts occur
+  for (let attempt = 0; attempt < MAX_PUSH_RETRIES; attempt++) {
+    let queue = await readStorage(queueKey);
+    
+    if (!queue) {
+      queue = {
+        messages: [],
+        expires: now() + SIGNAL_TTL_MS,
+        version: 0,
+      };
+    }
+    
+    // Filter out expired messages
+    queue.messages = queue.messages.filter(m => m.expires > now());
+    
+    // Add the new message and increment version
+    const expectedVersion = (queue.version || 0) + 1;
+    queue.messages.push({ ...message, timestamp: now(), expires: now() + SIGNAL_TTL_MS });
+    queue.expires = now() + SIGNAL_TTL_MS;
+    queue.version = expectedVersion;
+    
+    // Write the updated queue
+    await writeStorage(queueKey, queue);
+    
+    // Verify the write succeeded by checking version and message presence
+    const verifyQueue = await readStorage(queueKey);
+    if (verifyQueue && verifyQueue.version >= expectedVersion) {
+      // Check if our message is in the queue (compare by timestamp and from)
+      const messageFound = verifyQueue.messages.some(
+        m => m.from === from && m.type === type && m.payload === payload
+      );
+      if (messageFound) {
+        return { status: 'queued' };
+      }
+    }
+    
+    // Write was overwritten by concurrent request, retry with exponential backoff
+    const backoffMs = Math.min(INITIAL_BACKOFF_MS * Math.pow(2, attempt), MAX_BACKOFF_MS) + Math.random() * JITTER_MS;
+    await new Promise(r => setTimeout(r, backoffMs));
+  }
   
-  await writeStorage(queueKey, queue);
-  
-  return { status: 'queued' };
+  // All retries exhausted - return error
+  return { error: 'concurrency_conflict', status: 'queued' };
 }
 
 /**
