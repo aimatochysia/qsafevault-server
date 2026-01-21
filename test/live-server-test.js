@@ -694,6 +694,199 @@ async function testStressConcurrentLoad() {
   console.log(`✓ Stress test: ${successful}/${numOperations} operations in ${elapsed}ms`);
 }
 
+/**
+ * Test 100 concurrent users syncing simultaneously
+ * This simulates a real-world scenario where 100 different users
+ * are all syncing their vaults at the same time.
+ */
+async function testStress100ConcurrentUsers() {
+  console.log('Test: Stress - 100 concurrent users syncing');
+  
+  const numUsers = 100;
+  const startTime = Date.now();
+  
+  // Create 100 unique user sessions
+  const users = [];
+  for (let i = 0; i < numUsers; i++) {
+    users.push({
+      pin: generateRandomPin(),
+      passwordHash: `user100-${i}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      data: `user-${i}-vault-data-${Date.now()}`,
+    });
+  }
+  
+  // Phase 1: All 100 users send their data concurrently
+  console.log('  Phase 1: Sending data for 100 users...');
+  const sendPromises = users.map((user, index) =>
+    httpRequest('POST', '/api/relay', {
+      action: 'send',
+      pin: user.pin,
+      passwordHash: user.passwordHash,
+      chunkIndex: 0,
+      totalChunks: 1,
+      data: user.data,
+    }).catch(err => ({ status: 0, error: err.message, userIndex: index }))
+  );
+  
+  const sendResults = await Promise.all(sendPromises);
+  const sendElapsed = Date.now() - startTime;
+  const successfulSends = sendResults.filter(r => r.status === 200 && r.body?.status === 'waiting').length;
+  console.log(`  Sends completed: ${successfulSends}/${numUsers} in ${sendElapsed}ms`);
+  
+  // Phase 2: All users receive their data concurrently
+  console.log('  Phase 2: Receiving data for 100 users...');
+  const receiveStartTime = Date.now();
+  const receivePromises = users.map((user, index) =>
+    httpRequest('POST', '/api/relay', {
+      action: 'receive',
+      pin: user.pin,
+      passwordHash: user.passwordHash,
+    }).catch(err => ({ status: 0, error: err.message, userIndex: index }))
+  );
+  
+  const receiveResults = await Promise.all(receivePromises);
+  const receiveElapsed = Date.now() - receiveStartTime;
+  
+  // Verify data integrity
+  let successfulReceives = 0;
+  let dataMatchCount = 0;
+  for (let i = 0; i < numUsers; i++) {
+    const res = receiveResults[i];
+    if (res.status === 200 && res.body?.status === 'chunkAvailable') {
+      successfulReceives++;
+      if (res.body.chunk?.data === users[i].data) {
+        dataMatchCount++;
+      }
+    }
+  }
+  
+  const totalElapsed = Date.now() - startTime;
+  const successRate = Math.round((successfulReceives / numUsers) * 100);
+  const dataIntegrityRate = successfulReceives > 0 
+    ? Math.round((dataMatchCount / successfulReceives) * 100) 
+    : 0;
+  
+  console.log(`  Receives completed: ${successfulReceives}/${numUsers} in ${receiveElapsed}ms`);
+  console.log(`  Data integrity: ${dataMatchCount}/${successfulReceives} (${dataIntegrityRate}%)`);
+  console.log(`  Total time: ${totalElapsed}ms`);
+  
+  // Require at least 80% success rate for 100 concurrent users (relaxed from 90% due to scale)
+  const minSuccessRate = 0.8;
+  const minRequired = Math.floor(numUsers * minSuccessRate);
+  assertTruthy(
+    successfulSends >= minRequired, 
+    `At least ${minRequired}/${numUsers} sends should succeed (got ${successfulSends})`
+  );
+  assertTruthy(
+    successfulReceives >= minRequired, 
+    `At least ${minRequired}/${numUsers} receives should succeed (got ${successfulReceives})`
+  );
+  assertTruthy(
+    dataIntegrityRate >= 95, 
+    `Data integrity should be at least 95% (got ${dataIntegrityRate}%)`
+  );
+  
+  console.log(`✓ 100 concurrent users: ${successRate}% success, ${dataIntegrityRate}% data integrity, ${totalElapsed}ms total`);
+}
+
+/**
+ * Test 100 concurrent WebRTC signaling sessions
+ * Simulates 100 different peer pairs establishing WebRTC connections
+ */
+async function testStress100ConcurrentWebRTCSessions() {
+  console.log('Test: Stress - 100 concurrent WebRTC signaling sessions');
+  
+  const numSessions = 100;
+  const startTime = Date.now();
+  
+  // Create 100 peer pairs
+  const sessions = [];
+  for (let i = 0; i < numSessions; i++) {
+    sessions.push({
+      inviteCode: generateRandomPin(),
+      initiatorPeerId: `initiator-${i}-${Date.now()}`,
+      responderPeerId: `responder-${i}-${Date.now()}`,
+    });
+  }
+  
+  // Phase 1: Register all initiator peers concurrently
+  console.log('  Phase 1: Registering 100 initiator peers...');
+  const registerPromises = sessions.map((session, index) =>
+    httpRequest('POST', '/api/relay', {
+      action: 'register',
+      inviteCode: session.inviteCode,
+      peerId: session.initiatorPeerId,
+    }).catch(err => ({ status: 0, error: err.message, sessionIndex: index }))
+  );
+  
+  const registerResults = await Promise.all(registerPromises);
+  const registerElapsed = Date.now() - startTime;
+  const successfulRegisters = registerResults.filter(r => r.status === 200 && r.body?.status === 'registered').length;
+  console.log(`  Registrations completed: ${successfulRegisters}/${numSessions} in ${registerElapsed}ms`);
+  
+  // Phase 2: Look up all peers concurrently
+  console.log('  Phase 2: Looking up 100 peers...');
+  const lookupStartTime = Date.now();
+  const lookupPromises = sessions.map((session, index) =>
+    httpRequest('POST', '/api/relay', {
+      action: 'lookup',
+      inviteCode: session.inviteCode,
+    }).catch(err => ({ status: 0, error: err.message, sessionIndex: index }))
+  );
+  
+  const lookupResults = await Promise.all(lookupPromises);
+  const lookupElapsed = Date.now() - lookupStartTime;
+  
+  let successfulLookups = 0;
+  let peerIdMatchCount = 0;
+  for (let i = 0; i < numSessions; i++) {
+    const res = lookupResults[i];
+    if (res.status === 200 && res.body?.peerId) {
+      successfulLookups++;
+      if (res.body.peerId === sessions[i].initiatorPeerId) {
+        peerIdMatchCount++;
+      }
+    }
+  }
+  
+  console.log(`  Lookups completed: ${successfulLookups}/${numSessions} in ${lookupElapsed}ms`);
+  
+  // Phase 3: Send signals from all responders to initiators
+  console.log('  Phase 3: Sending 100 offer signals...');
+  const signalStartTime = Date.now();
+  const signalPromises = sessions.map((session, index) =>
+    httpRequest('POST', '/api/relay', {
+      action: 'signal',
+      from: session.responderPeerId,
+      to: session.initiatorPeerId,
+      type: 'offer',
+      payload: `offer-payload-session-${index}`,
+    }).catch(err => ({ status: 0, error: err.message, sessionIndex: index }))
+  );
+  
+  const signalResults = await Promise.all(signalPromises);
+  const signalElapsed = Date.now() - signalStartTime;
+  const successfulSignals = signalResults.filter(r => r.status === 200 && r.body?.status === 'queued').length;
+  console.log(`  Signals sent: ${successfulSignals}/${numSessions} in ${signalElapsed}ms`);
+  
+  const totalElapsed = Date.now() - startTime;
+  const overallSuccessRate = Math.round(((successfulRegisters + successfulLookups + successfulSignals) / (numSessions * 3)) * 100);
+  
+  // Require at least 80% success rate
+  const minSuccessRate = 0.8;
+  const minRequired = Math.floor(numSessions * minSuccessRate);
+  assertTruthy(
+    successfulRegisters >= minRequired, 
+    `At least ${minRequired}/${numSessions} registrations should succeed (got ${successfulRegisters})`
+  );
+  assertTruthy(
+    successfulSignals >= minRequired, 
+    `At least ${minRequired}/${numSessions} signals should succeed (got ${successfulSignals})`
+  );
+  
+  console.log(`✓ 100 concurrent WebRTC sessions: ${overallSuccessRate}% overall success, ${totalElapsed}ms total`);
+}
+
 async function testStressWebRTCSignaling() {
   console.log('Test: Stress - WebRTC signaling with multiple peers');
   
@@ -778,6 +971,10 @@ async function runLiveTests() {
     console.log('\n--- Stress Tests ---');
     await testStressConcurrentLoad();
     await testStressWebRTCSignaling();
+    
+    console.log('\n--- 100 Concurrent Users Tests ---');
+    await testStress100ConcurrentUsers();
+    await testStress100ConcurrentWebRTCSessions();
     
     console.log('\n=== All Live Server Tests Passed! ===');
     process.exit(0);

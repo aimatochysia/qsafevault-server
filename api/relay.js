@@ -20,6 +20,9 @@
 
 const sessionManager = require('../sessionManager');
 
+// Valid WebRTC signal types per spec
+const VALID_SIGNAL_TYPES = ['offer', 'answer', 'ice-candidate'];
+
 module.exports = async function relayHandler(req, res) {
   const action = req.method === 'GET' ? req.query.action : req.body.action;
   if (!action) return res.status(400).json({ error: 'missing_action' });
@@ -140,6 +143,10 @@ module.exports = async function relayHandler(req, res) {
     const { from, to, type, payload } = req.body;
     if (!from || !to || !type || !payload) {
       return res.status(400).json({ error: 'missing_fields' });
+    }
+    // Validate signal type
+    if (!VALID_SIGNAL_TYPES.includes(type)) {
+      return res.status(400).json({ error: 'invalid_signal_type', validTypes: VALID_SIGNAL_TYPES });
     }
     try {
       const result = await sessionManager.queueSignal({ from, to, type, payload });

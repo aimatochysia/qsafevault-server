@@ -1,6 +1,6 @@
 const { getSessionIdByPin } = require('./sessionStore');
 
-module.exports = function sessionsResolve(req, res) {
+module.exports = async function sessionsResolve(req, res) {
   if (req.method !== 'GET') {
     res.statusCode = 405;
     res.end();
@@ -13,8 +13,15 @@ module.exports = function sessionsResolve(req, res) {
     res.end(JSON.stringify({ error: 'missing_pin' }));
     return;
   }
-  const result = getSessionIdByPin(pin);
-  res.statusCode = result.error ? 404 : 200;
-  res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.end(JSON.stringify(result));
+  
+  try {
+    const result = await getSessionIdByPin(pin);
+    res.statusCode = result.error ? 404 : 200;
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.end(JSON.stringify(result));
+  } catch (e) {
+    res.statusCode = 500;
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.end(JSON.stringify({ error: 'server_error' }));
+  }
 };

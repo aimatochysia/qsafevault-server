@@ -20,6 +20,11 @@
  * EDITION SYSTEM:
  * - Consumer: Stateless relay, ephemeral storage, public deployment allowed
  * - Enterprise: Device registry, audit logging, self-hosted only
+ * 
+ * SCALABILITY:
+ * - Vercel Blob for cross-instance persistence
+ * - Optimistic concurrency control for parallel requests
+ * - Supports 100s of concurrent users
  */
 
 const express = require('express');
@@ -80,6 +85,18 @@ const sessionDelete = require('./api/v1/sessions/[sessionId]/index');
 const registerDevice = require('./api/v1/devices/index').registerDevice;
 const listDevices = require('./api/v1/devices/[userId]');
 
+// ==================== Health Check ====================
+// Used by load balancers and orchestrators
+
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    edition: editionConfig.edition,
+    uptime: process.uptime(),
+    timestamp: Date.now(),
+  });
+});
+
 // Edition handshake endpoint - clients use this to verify server edition
 app.get('/api/v1/edition', (req, res) => {
   res.json(editionConfig.getEditionInfo());
@@ -110,6 +127,7 @@ app.delete('/api/v1/sessions/:sessionId', (req, res) => {
   sessionDelete(req, res);
 });
 
+// Device registry (Enterprise only)
 app.post('/api/v1/devices', registerDevice);
 app.get('/api/v1/devices/:userId', (req, res) => {
   req.query = { ...req.query, userId: req.params.userId };
@@ -120,11 +138,43 @@ app.use((req, res) => {
   res.status(404).json({ error: 'not_found' });
 });
 
+// ==================== Server Startup ====================
+
 const port = process.env.PORT || 3000;
+let server = null;
+
 if (require.main === module) {
-  app.listen(port, () => {
+  server = app.listen(port, () => {
     console.log(`qsafevault-server listening on http://localhost:${port}`);
   });
+  
+  // ==================== Graceful Shutdown ====================
+  
+  function gracefulShutdown(signal) {
+    console.log(`\nReceived ${signal}. Shutting down gracefully...`);
+    
+    if (server) {
+      server.close((err) => {
+        if (err) {
+          console.error('Error during shutdown:', err);
+          process.exit(1);
+        }
+        console.log('Server closed successfully');
+        process.exit(0);
+      });
+      
+      // Force close after 10 seconds
+      setTimeout(() => {
+        console.error('Forced shutdown after timeout');
+        process.exit(1);
+      }, 10000);
+    } else {
+      process.exit(0);
+    }
+  }
+  
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 }
 
 module.exports = app;
